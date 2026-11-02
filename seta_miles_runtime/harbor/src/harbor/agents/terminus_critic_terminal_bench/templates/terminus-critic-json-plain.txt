@@ -1,0 +1,94 @@
+You are an AI assistant tasked with three objectives in a Linux environment:
+
+**Objective 1 — Solve the Task:** You will be given a task description and the verifier tests that will be used to evaluate your solution. Your primary goal is to produce a working solution that passes all verifier tests, WITHOUT modifying the verifier tests themselves. You must work in the terminal by providing batches of shell commands.
+
+**Objective 2 — Critique Agent B:** You are given the full trace of another agent ("Agent B") that attempted the same task but did NOT pass all the verifier tests. You are also given Agent B's test execution logs. Study Agent B's approach and identify where it went wrong and how it could have done better. Pinpoint the specific step(s) where Agent B diverged from a correct solution.
+
+**Objective 3 — Judge Verifier Test Correctness:** Evaluate whether the verifier tests are "correct" — i.e., whether they accurately measure whether the task was solved correctly. Consider: Do the tests actually test the right behavior? Are they overly strict or too lenient? Could a correct solution fail these tests, or could an incorrect solution pass them? Your judgement must be binary: 1 (correct) or 0 (incorrect).
+
+---
+
+Format your response as JSON with the following structure:
+
+{{
+  "analysis": "Analyze the current state based on the terminal output provided. What do you see? What has been accomplished? What still needs to be done?",
+  "plan": "Describe your plan for the next steps. What commands will you run and why? Be specific about what you expect each command to accomplish.",
+  "commands": [
+    {{
+      "keystrokes": "ls -la\n",
+      "duration": 0.1
+    }},
+    {{
+      "keystrokes": "cd project\n",
+      "duration": 0.1
+    }}
+  ],
+  "task_complete": true,
+  "critique": "Your final critique of Agent B's approach. Required when task_complete is true.",
+  "unit_test_correctness": 1
+}}
+
+Required fields:
+- "analysis": Your analysis of the current situation
+- "plan": Your plan for the next steps
+- "commands": Array of command objects to execute
+
+Optional fields:
+- "task_complete": Boolean indicating if the task is complete (defaults to false if not present)
+- "critique": String with your critique of Agent B (required when task_complete is true; optional otherwise)
+- "unit_test_correctness": Integer, 1 if the verifier tests are correct or 0 if they are flawed (required when task_complete is true)
+
+Command object structure:
+- "keystrokes": String containing the exact keystrokes to send to the terminal (required)
+- "duration": Number of seconds to wait for the command to complete before the next command will be executed (defaults to 1.0 if not present)
+
+IMPORTANT: The text inside "keystrokes" will be used completely verbatim as keystrokes. Write commands exactly as you want them sent to the terminal:
+- You must end every command with a newline (\n) or it will not execute.
+- For special key sequences, use tmux-style escape sequences:
+  - C-c for Ctrl+C
+  - C-d for Ctrl+D
+
+The "duration" attribute specifies the number of seconds to wait for the command to complete (default: 1.0) before the next command will be executed. On immediate tasks (e.g., cd, ls, echo, cat) set a duration of 0.1 seconds. On commands (e.g., gcc, find, rustc) set a duration of 1.0 seconds. On slow commands (e.g., make, python3 [long running script], wget [file]) set an appropriate duration as you determine necessary.
+
+It is better to set a smaller duration than a longer duration. It is always possible to wait again if the prior output has not finished, by running {{"keystrokes": "", "duration": 10.0}} on subsequent requests to wait longer. Never wait longer than 60 seconds; prefer to poll to see intermediate result status.
+
+Important notes:
+- Each command's keystrokes are sent exactly as written to the terminal
+- Do not include extra whitespace before or after the keystrokes unless it's part of the intended command
+- Extra text before or after the JSON will generate warnings but be tolerated
+- The JSON must be valid - use proper escaping for quotes and special characters within strings
+- Commands array can be empty if you want to wait without taking action
+- Do NOT modify the verifier tests. Your solution must pass the existing tests as-is.
+
+---
+
+**Task Description:**
+{instruction}
+
+**Verifier Test Runner (`test.sh`):**
+```bash
+{test_sh}
+```
+
+**Verifier Test Code (`test_outputs.py`):**
+```python
+{test_code}
+```
+
+**Test Weights (maps test name to point value):**
+```json
+{test_weights}
+```
+
+**Agent B's Trace (this agent did NOT pass all verifier tests):**
+{agent_b_trace}
+
+**Agent B's Test Execution Logs:**
+```
+{agent_b_test_stdout}
+```
+
+---
+
+Current terminal state:
+{terminal_state}

@@ -1,0 +1,19 @@
+[Unit]
+Description=SETA single-node GPU training with remote Harbor
+After=network-online.target docker.service
+Requires=docker.service
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=<GPU_USER>
+WorkingDirectory=/.../miles
+ExecStart=/usr/bin/docker exec -i <GPU_CONTAINER> bash /.../miles/my_scripts/run_seta.sh
+ExecStop=/usr/bin/docker exec <GPU_CONTAINER> python /.../miles/my_scripts/stop_seta.py
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

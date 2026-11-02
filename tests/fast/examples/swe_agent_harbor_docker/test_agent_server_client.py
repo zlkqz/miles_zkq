@@ -8,6 +8,7 @@ import asyncio
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -35,11 +36,7 @@ async def _peak_concurrent_trials(module: ModuleType, num_trials: int) -> int:
         nonlocal active, peak
         while True:
             headers = await reader.readuntil(b"\r\n\r\n")
-            length = next(
-                int(line.split(b":", 1)[1])
-                for line in headers.split(b"\r\n")
-                if line.lower().startswith(b"content-length:")
-            )
+            length = next(int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n") if line.lower().startswith(b"content-length:"))
             await reader.readexactly(length)
             active += 1
             peak = max(peak, active)
@@ -53,10 +50,7 @@ async def _peak_concurrent_trials(module: ModuleType, num_trials: int) -> int:
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
-        posts = [
-            asyncio.create_task(module._post_agent_server(f"http://127.0.0.1:{port}/run", {"i": i}))
-            for i in range(num_trials)
-        ]
+        posts = [asyncio.create_task(module._post_agent_server(f"http://127.0.0.1:{port}/run", {"i": i})) for i in range(num_trials)]
         # Let every post that the pool admits reach the server.
         for _ in range(100):
             await asyncio.sleep(0.02)
@@ -92,3 +86,39 @@ def test_invalid_max_connections_falls_back_to_no_cap(value: str, monkeypatch: p
     module = _load_agent_function()
 
     assert asyncio.run(_peak_concurrent_trials(module, NUM_TRIALS)) == NUM_TRIALS
+
+
+def test_explicit_endpoint_auth_and_result_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_agent_function()
+    post = AsyncMock(
+        return_value={
+            "reward": 1.2,
+            "exit_status": "Submitted",
+            "metadata": {"seta_valid_reward": True, "trial_dir": "/trials/one", "reward": 99.0},
+        }
+    )
+    monkeypatch.setattr(module, "_post_agent_server", post)
+    metadata = {"instance_id": "one", "agent_name": "terminus-2", "run_id": "one-run"}
+    headers = {"Authorization": "Bearer test-token"}
+
+    result = asyncio.run(
+        module.run(
+            "http://gpu:30000/sessions/one",
+            None,
+            {"temperature": 0.8},
+            metadata,
+            agent_server_url="http://sandbox:18080",
+            headers=headers,
+            trial_timeout_s=10,
+        )
+    )
+
+    args, kwargs = post.call_args
+    assert args[0] == "http://sandbox:18080/run"
+    assert args[1]["base_url"] == "http://gpu:30000/sessions/one/v1"
+    assert args[1]["sampling_params"] == {"temperature": 0.8}
+    assert args[1]["run_id"] == "one-run"
+    assert kwargs["headers"] == headers
+    assert result["seta_valid_reward"] and result["trial_dir"] == "/trials/one"
+    assert result["reward"] == 1.2
+    assert metadata == {"instance_id": "one", "agent_name": "terminus-2", "run_id": "one-run"}

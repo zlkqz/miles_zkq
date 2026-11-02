@@ -1,0 +1,9 @@
+{
+  "endpoints": [
+    {
+      "url": "http://<SANDBOX_HOST>:18080",
+      "max_concurrent": 8,
+      "token_file": "/.../miles/seta_miles_runtime/secrets/remote-token"
+    }
+  ]
+}

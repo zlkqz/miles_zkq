@@ -195,3 +195,19 @@ _examples_synced/
 .humanize/
 
 charts/*/charts/
+
+# SETA：Harbor 源码与部署模板随仓库交付，其余 runtime 内容保持本地。
+/seta_miles_runtime/*
+!/seta_miles_runtime/harbor/
+!/seta_miles_runtime/harbor/.vscode/settings.json
+!/seta_miles_runtime/harbor/apps/viewer/app/lib/
+!/seta_miles_runtime/harbor/docs/src/lib/
+!/seta_miles_runtime/README.md
+!/seta_miles_runtime/harbor-source.json
+!/seta_miles_runtime/harbor-local-patches.md
+!/seta_miles_runtime/harbor-local.patch
+!/seta_miles_runtime/seta-remote/
+/seta_miles_runtime/seta-remote/*
+!/seta_miles_runtime/seta-remote/config.json
+!/seta_miles_runtime/seta-remote/setup.py
+!/seta_miles_runtime/seta-remote/README.md

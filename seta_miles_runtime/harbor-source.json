@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/harbor-framework/harbor.git",
+  "branch": "harbor-miles-v0.20.0",
+  "commit": "ac63e51a8fe8167347b2c91be7d1804faf89df10",
+  "tree": "5fa287ffb884c32f695195069b8954541ebcc78b",
+  "license": "Apache-2.0",
+  "delivery": "source snapshot included in Miles; no nested Git repository",
+  "local_patch": "harbor-local.patch",
+  "local_patch_notes": "harbor-local-patches.md"
+}

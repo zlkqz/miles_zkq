@@ -1,0 +1,374 @@
+--- a/miles_agent_server.py
++++ b/miles_agent_server.py
+@@ -26,8 +26,9 @@
+ import asyncio
+ import hmac
+ import logging
++import shutil
+ import uuid
+-from collections.abc import AsyncIterator
++from collections.abc import AsyncGenerator
+ from contextlib import asynccontextmanager
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -68,23 +69,44 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-_ADMIN_SECRET = os.getenv("HARBOR_ADMIN_SECRET")
++def _read_secret(name: str) -> str | None:
++    if value := os.getenv(name, ""):
++        return value
++    if path := os.getenv(name + "_FILE", ""):
++        value = Path(path).read_text().strip()
++        if not value:
++            raise ValueError(f"Empty credential file: {path}")
++        return value
++    return None
++
++
++_ADMIN_SECRET = _read_secret("HARBOR_ADMIN_SECRET")
++_RUN_SECRET = _read_secret("HARBOR_RUN_SECRET")
+ 
+ 
+ _request_logger: RequestLogger | None = None
+ 
+ 
+ @asynccontextmanager
+-async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
++async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
+     max_concurrent = int(
+         os.getenv("AGENT_MAX_CONCURRENT", os.getenv("SWE_AGENT_MAX_CONCURRENT", "8"))
+     )
+     _state.semaphore = asyncio.Semaphore(max_concurrent)
++    _state.max_concurrent = max_concurrent
+     logger.info(f"Initialized semaphore with max_concurrent={max_concurrent}")
+     checker_task = asyncio.create_task(_health_checker_loop())
+     # no local docker in daytona mode → skip the docker build-cache prune loop
+     _daytona = os.getenv("HARBOR_ENV_TYPE", "docker").lower() == "daytona"
+-    prune_task = None if _daytona else asyncio.create_task(_docker_prune_loop())
++    prune_enabled = os.getenv("HARBOR_DOCKER_PRUNE_ENABLED", "true").lower() in {
++        "1",
++        "true",
++    }
++    prune_task = (
++        asyncio.create_task(_docker_prune_loop())
++        if not _daytona and prune_enabled
++        else None
++    )
+     try:
+         yield
+     finally:
+@@ -113,8 +135,14 @@
+ 
+ 
+ @app.post("/run")
+-async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse:
++async def run_instance(
++    request: RunRequest, raw_request: Request, authorization: str | None = Header(None)
++) -> RunResponse:
+     """Run an agent on a single task instance via Harbor."""
++    if _RUN_SECRET is not None and not hmac.compare_digest(
++        authorization or "", f"Bearer {_RUN_SECRET}"
++    ):
++        raise HTTPException(status_code=403, detail="Invalid or missing run secret")
+     client_host = raw_request.client.host if raw_request.client else "unknown"
+     client_port = str(raw_request.client.port) if raw_request.client else "unknown"
+     sid = request.session_server_id
+@@ -189,9 +217,7 @@
+         )
+ 
+     current_task = asyncio.current_task()
+-    if current_task is not None:
+-        _state.inflight_tasks.add(current_task)
+-    if tracking_key and heartbeat_target and current_task:
++    if bool(tracking_key) and bool(heartbeat_target) and current_task is not None:
+         try:
+             _register_active_task(
+                 tracking_key,
+@@ -209,6 +235,10 @@
+                 exc,
+             )
+             return RunResponse(**_error_response("InvalidSessionServerId"))
++    if current_task is not None:
++        _state.inflight_tasks.add(current_task)
++        if request.run_id is not None:
++            _state.run_tasks.setdefault(request.run_id, set()).add(current_task)
+     try:
+         async with get_semaphore():
+             result = await run_trial_in_subprocess(request)
+@@ -223,7 +253,14 @@
+     finally:
+         if current_task is not None:
+             _state.inflight_tasks.discard(current_task)
+-        if tracking_key and current_task:
++            if (
++                request.run_id is not None
++                and (tasks := _state.run_tasks.get(request.run_id)) is not None
++            ):
++                tasks.discard(current_task)
++                if not tasks:
++                    _state.run_tasks.pop(request.run_id, None)
++        if bool(tracking_key) and current_task is not None:
+             _discard_active_task(tracking_key, current_task)
+ 
+     logger.info(
+@@ -255,11 +292,20 @@
+ 
+ @app.get("/health")
+ async def health():
+-    return {"status": "ok"}
++    directory = _state.trials_dir or Path.cwd()
++    return {
++        "status": "ok",
++        "protocol": "harbor-agent-server-v1",
++        "max_concurrent": _state.max_concurrent,
++        "active": len(_state.inflight_tasks),
++        "tasks_dir": os.getenv("HARBOR_TASKS_DIR", ""),
++        "docker_config": os.getenv("DOCKER_CONFIG", ""),
++        "free_gb": round(shutil.disk_usage(directory).free / 1024**3, 2),
++    }
+ 
+ 
+ def _require_admin_secret(authorization: str | None) -> None:
+-    if not _ADMIN_SECRET:
++    if not bool(_ADMIN_SECRET):
+         return
+     if not hmac.compare_digest(authorization or "", f"Bearer {_ADMIN_SECRET}"):
+         raise HTTPException(status_code=403, detail="Invalid or missing admin secret")
+@@ -271,6 +317,19 @@
+ ):
+     """Cancel all in-flight trials for a given session server (admin only)."""
+     _require_admin_secret(authorization)
++    if request.run_id is not None:
++        tasks = _state.run_tasks.get(request.run_id, set())
++        cancelled = sum(
++            1
++            for task in list(tasks)
++            if not task.done() and not task.cancelling() and task.cancel()
++        )
++        # 不让后续心跳对正在执行清理的子进程重复发送取消。
++        for key, tracked in list(_state.active_tasks.items()):
++            tracked.tasks.difference_update(tasks)
++            if not tracked.tasks:
++                _state.active_tasks.pop(key, None)
++        return {"run_id": request.run_id, "cancelled": cancelled}
+     if request.session_server_instance_id is not None:
+         try:
+             tracking_key = _normalize_session_server_instance_id(
+@@ -389,7 +448,11 @@
+     args = parser.parse_args()
+ 
+     # daytona runs in the cloud (no local docker) → skip the Docker Hub login guard
+-    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "daytona":
++    require_login = os.getenv("HARBOR_REQUIRE_DOCKER_LOGIN", "true").lower() in {
++        "1",
++        "true",
++    }
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "daytona" and require_login:
+         _check_docker_login()
+ 
+     _state.agent_timeout_sec = args.agent_timeout
+@@ -444,7 +507,7 @@
+         app.mount("/dashboard", dashboard_app)
+         logger.info(f"Dashboard mounted at http://{args.host}:{args.port}/dashboard/")
+ 
+-    uvicorn.run(app, host=args.host, port=args.port)
++    uvicorn.run(app, host=args.host, port=args.port, timeout_graceful_shutdown=5)
+ 
+ 
+ if __name__ == "__main__":
+--- a/agent_server/models.py
++++ b/agent_server/models.py
+@@ -2,7 +2,7 @@
+ 
+ from typing import Any
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ 
+ 
+ class RunRequest(BaseModel):
+@@ -16,6 +16,7 @@
+     max_seq_len: int | None = None
+     session_server_id: str | None = None
+     session_server_instance_id: str | None = None
++    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,100}$")
+     model_config = {"extra": "allow"}
+ 
+ 
+@@ -24,11 +25,13 @@
+     exit_status: str = ""
+     agent_metrics: dict[str, Any] = {}
+     eval_report: dict[str, Any] = {}
++    metadata: dict[str, Any] = Field(default_factory=dict)
+ 
+ 
+ class FlushRequest(BaseModel):
+     session_server_id: str | None = None
+     session_server_instance_id: str | None = None
++    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,100}$")
+ 
+ 
+ class FlushAllRequest(BaseModel):
+--- a/agent_server/state.py
++++ b/agent_server/state.py
+@@ -22,6 +22,7 @@
+ 
+ @dataclass
+ class ServerState:
++    run_tasks: dict[str, set[asyncio.Task]] = field(default_factory=dict)
+     # tracking_key -> tracked session server state
+     active_tasks: dict[str, TrackedSessionServer] = field(default_factory=dict)
+     # Compose project names for every trial this server process has started, used
+@@ -37,6 +38,7 @@
+     # heartbeat-based ``active_tasks`` only covers Miles-session-server requests).
+     inflight_tasks: set[asyncio.Task] = field(default_factory=set)
+     semaphore: asyncio.Semaphore | None = None
++    max_concurrent: int = 8
+     # Startup config resolved once in ``main()`` and read while running a trial:
+     # where trial outputs are written, and the agent run/setup timeout overrides
+     # (``None`` = use Harbor's per-task defaults).
+--- a/agent_server/trial_runner.py
++++ b/agent_server/trial_runner.py
+@@ -7,11 +7,14 @@
+ """
+ 
+ import asyncio
++import contextlib
+ import hmac
++import importlib
+ import json
+ import logging
+ import os
+ import re
++import signal
+ import sys
+ import traceback
+ from pathlib import Path
+@@ -210,7 +213,11 @@
+ 
+     if os.getenv("HARBOR_ENV_TYPE", "docker").lower() == "daytona":
+         disk_gb = int(os.getenv("HARBOR_DAYTONA_DISK_GB", "10"))
+-        auto_snap = os.getenv("HARBOR_DAYTONA_AUTO_SNAPSHOT", "1").lower() in ("1", "true", "t")
++        auto_snap = os.getenv("HARBOR_DAYTONA_AUTO_SNAPSHOT", "1").lower() in (
++            "1",
++            "true",
++            "t",
++        )
+         # Orphan backstop: a sandbox whose trial teardown never runs (server
+         # crash, killed subprocess) would otherwise run — and bill — forever.
+         # Auto-stop must outlast the longest trial: an in-sandbox agent's
+@@ -223,7 +230,8 @@
+         auto_delete_min = int(os.getenv("HARBOR_DAYTONA_AUTO_DELETE_MIN", "1440"))
+         return EnvironmentConfig(
+             type="daytona",
+-            delete=os.getenv("HARBOR_KEEP_SANDBOX", "false").lower() not in ("true", "1", "t"),
++            delete=os.getenv("HARBOR_KEEP_SANDBOX", "false").lower()
++            not in ("true", "1", "t"),
+             override_memory_mb=override_memory_mb,
+             override_storage_mb=disk_gb * 1024,
+             kwargs={
+@@ -234,7 +242,8 @@
+         )
+     return EnvironmentConfig(
+         type="docker",
+-        delete=os.getenv("HARBOR_DELETE_CONTAINERS", "false").lower() in ("true", "1", "t"),
++        delete=os.getenv("HARBOR_DELETE_CONTAINERS", "false").lower()
++        in ("true", "1", "t"),
+         override_memory_mb=override_memory_mb,
+         # Baseline allowlist: covers agent *setup* (in-sandbox installs) and the
+         # verifier, which AgentConfig.extra_allowed_hosts does not.
+@@ -449,24 +458,38 @@
+         }
+     )
+     proc = await asyncio.create_subprocess_exec(
+-        sys.executable, "-m", "agent_server.trial_runner",
++        sys.executable,
++        "-m",
++        "agent_server.trial_runner",
+         cwd=str(harbor_root),
+         stdin=asyncio.subprocess.PIPE,
+         stdout=asyncio.subprocess.PIPE,
+         stderr=asyncio.subprocess.PIPE,
++        start_new_session=True,
+     )
++    communicate = asyncio.create_task(proc.communicate(blob.encode()))
+     try:
+-        out, err = await proc.communicate(blob.encode())
++        out, err = await asyncio.shield(communicate)
+     except asyncio.CancelledError:
+         # On /flush the awaiting task is cancelled; the child is NOT reaped
+         # automatically, so it would keep running the full trial (and holding a
+         # Daytona sandbox) until it finishes. Kill and reap it before re-raising.
+-        proc.kill()
+-        await proc.wait()
++        if proc.returncode is None:
++            with contextlib.suppress(ProcessLookupError):
++                proc.terminate()
++        try:
++            await asyncio.wait_for(
++                asyncio.shield(communicate),
++                float(os.getenv("HARBOR_WORKER_CANCEL_TIMEOUT_SEC", "120")),
++            )
++        except TimeoutError:
++            with contextlib.suppress(ProcessLookupError):
++                os.killpg(proc.pid, signal.SIGKILL)
++            await communicate
+         raise
+     for line in reversed(out.decode(errors="replace").splitlines()):
+         if line.startswith(_WORKER_RESULT_MARKER):
+-            result = json.loads(line[len(_WORKER_RESULT_MARKER):])
++            result = json.loads(line[len(_WORKER_RESULT_MARKER) :])
+             # trial_name is generated in the child (non-deterministic timestamp
+             # + uuid), so the compose project name can only be registered in the
+             # parent from what the child reports back.
+@@ -476,9 +499,21 @@
+             return result
+     logger.error(
+         "trial worker produced no RESULT (rc=%s)\nstderr tail:\n%s",
+-        proc.returncode, err.decode(errors="replace")[-2000:],
++        proc.returncode,
++        err.decode(errors="replace")[-2000:],
+     )
+     return _error_response("Error: NoResult")
++
++
++async def _run_worker(request: RunRequest) -> dict[str, Any]:
++    task = asyncio.current_task()
++    if task is not None:
++        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
++    runner = _run_trial
++    if path := os.getenv("HARBOR_TRIAL_RUNNER"):
++        module, name = path.rsplit(".", 1)
++        runner = getattr(importlib.import_module(module), name)
++    return await runner(request)
+ 
+ 
+ def _worker_main() -> None:
+@@ -489,7 +524,10 @@
+     _state.agent_timeout_sec = data.get("agent_timeout_sec")
+     _state.agent_setup_timeout_sec = data.get("agent_setup_timeout_sec")
+     logging.basicConfig(level=logging.INFO)
+-    result = asyncio.run(_run_trial(RunRequest(**data["request"])))
++    try:
++        result = asyncio.run(_run_worker(RunRequest(**data["request"])))
++    except asyncio.CancelledError:
++        raise SystemExit(130) from None
+     print(_WORKER_RESULT_MARKER + json.dumps(result, default=str), flush=True)
+ 
+ 
+--- a/agent_server/background.py
++++ b/agent_server/background.py
+@@ -56,7 +56,10 @@
+ 
+ async def _health_checker_loop():
+     """Poll known Miles session servers; flush those that become unreachable."""
+-    client = httpx.AsyncClient(timeout=httpx.Timeout(_HEARTBEAT_TIMEOUT))
++    # Miles callbacks are direct control-plane traffic, separate from download proxies.
++    client = httpx.AsyncClient(
++        timeout=httpx.Timeout(_HEARTBEAT_TIMEOUT), trust_env=False
++    )
+     failures: dict[str, int] = {}
+     try:
+         while True:

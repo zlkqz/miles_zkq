@@ -72,9 +72,9 @@ def _get_agent_server_client() -> httpx.AsyncClient:
     return _agent_server_client
 
 
-async def _post_agent_server(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_agent_server(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
     client = _get_agent_server_client()
-    response = await client.post(url, json=payload)
+    response = await client.post(url, json=payload, **({"headers": headers} if headers else {}))
     response.raise_for_status()
     return response.json()
 
@@ -84,13 +84,16 @@ async def run(
     prompt: Any,
     request_kwargs: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    agent_server_url: str | None = None,
+    headers: dict[str, str] | None = None,
+    trial_timeout_s: float | None = None,
     **kwargs,
 ) -> dict[str, Any] | None:
     """Run a single task instance via the Harbor agent server."""
     metadata = metadata or {}
     request_kwargs = request_kwargs or {}
 
-    agent_server_url = os.getenv(
+    agent_server_url = agent_server_url or os.getenv(
         "AGENT_SERVER_URL",
         os.getenv("SWE_AGENT_URL", "http://localhost:11000"),
     )
@@ -120,10 +123,10 @@ async def run(
     if session_server_instance_id is not None:
         request["session_server_instance_id"] = session_server_instance_id
 
-    trial_timeout_s = _agent_trial_timeout_s()
+    trial_timeout_s = _agent_trial_timeout_s() if trial_timeout_s is None else trial_timeout_s
     try:
         response = await asyncio.wait_for(
-            _post_agent_server(f"{agent_server_url}/run", request),
+            _post_agent_server(f"{agent_server_url}/run", request, **({"headers": headers} if headers else {})),
             timeout=trial_timeout_s,
         )
     except asyncio.TimeoutError:
@@ -137,6 +140,7 @@ async def run(
         return None
 
     return {
+        **response.get("metadata", {}),
         "reward": response.get("reward", 0.0),
         "exit_status": response.get("exit_status", ""),
         "eval_report": response.get("eval_report", {}),

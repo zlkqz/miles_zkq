@@ -1,0 +1,13 @@
+{
+  "service_id": "seta-worker-1",
+  "host": "0.0.0.0",
+  "port": 18080,
+  "tasks_dir": "/.../seta-remote/tasks",
+  "state_dir": "/.../seta-remote/state",
+  "max_concurrent": 8,
+  "token_file": "/.../seta-remote/state/remote-token",
+  "min_free_gb": 15,
+  "max_trial_timeout": 7200,
+  "image_cache_keep": 16,
+  "crane": "/.../seta-remote/tools/crane"
+}

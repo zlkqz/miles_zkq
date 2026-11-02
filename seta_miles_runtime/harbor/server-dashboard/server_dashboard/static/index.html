@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Server Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="static/favicon.svg" />
+  <link rel="stylesheet" href="static/style.css?v=5" />
+</head>
+<body>
+  <div id="main-area">
+    <h1>Agent Server Dashboard</h1>
+    <p class="subtitle">
+      <span class="refresh-indicator"></span>
+      Auto-refreshing every 5s
+      &mdash; <span id="lastUpdated">never</span>
+    </p>
+
+    <div class="controls">
+      <label>Session:
+        <select id="sessionSelect" onchange="onSessionChange()"></select>
+      </label>
+      <label>Filter status:
+        <select id="statusFilter" onchange="renderFiltered()">
+          <option value="all">All</option>
+          <option value="pending">Pending</option>
+          <option value="completed">Completed</option>
+          <option value="flushed">Flushed</option>
+          <option value="error">Error</option>
+        </select>
+      </label>
+      <label>Search:
+        <input type="text" class="search-box" id="searchBox"
+               placeholder="instance id, hostname..." oninput="renderFiltered()" />
+      </label>
+    </div>
+
+    <div class="stats" id="statsBar"></div>
+    <div id="content"><p class="empty">Loading&hellip;</p></div>
+  </div>
+
+  <!-- Trace overlay + side panel -->
+  <div class="trace-backdrop" id="traceBackdrop" onclick="closeTrace()"></div>
+  <div id="tracePanel" class="trace-panel">
+    <div class="trace-panel-header">
+      <button class="trace-close-btn" onclick="closeTrace()">&times;</button>
+      <span class="trace-instance-id" id="traceInstanceId"></span>
+      <span id="traceStatusBadge"></span>
+    </div>
+    <div class="trace-panel-info">
+      <button class="trace-info-toggle" id="traceInfoToggle">&#9654; Run Info</button>
+      <div class="trace-info-body" id="traceInfoBody">
+        <dl class="trace-info-grid" id="traceInfoGrid"></dl>
+      </div>
+    </div>
+    <div class="trace-panel-body">
+      <div class="trace-step-nav" id="traceStepNav"></div>
+      <div class="trace-messages" id="traceMessages">
+        <div class="trace-loading">Select a request to view its trace.</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="static/app.js?v=5"></script>
+</body>
+</html>

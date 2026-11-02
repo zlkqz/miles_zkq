@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trace Viewer</title>
+<style>
+/* ---- Reset & base ---- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
+a { color: #58a6ff; }
+
+/* ---- Top bar ---- */
+.topbar { position: sticky; top: 0; z-index: 100; background: #161b22; border-bottom: 1px solid #30363d; padding: 10px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.topbar .nav-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 14px; text-decoration: none; transition: background .15s; }
+.topbar .nav-btn:hover { background: #30363d; }
+.topbar .instance-id { font-size: 14px; font-weight: 600; color: #e6edf3; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Badges ---- */
+.badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 12px; }
+.badge-submitted, .badge-completed { background: #238636; color: #fff; }
+.badge-error { background: #da3633; color: #fff; }
+.badge-unknown { background: #484f58; color: #c9d1d9; }
+
+/* ---- Info panel ---- */
+.info-panel { background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; }
+.info-toggle { display: block; width: 100%; background: none; border: none; color: #8b949e; padding: 10px 0; cursor: pointer; font-size: 13px; text-align: left; }
+.info-toggle:hover { color: #c9d1d9; }
+.info-body { display: none; padding-bottom: 14px; }
+.info-body.open { display: block; }
+.info-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 20px; margin-bottom: 12px; align-items: baseline; }
+.info-grid dt { font-size: 12px; color: #8b949e; white-space: nowrap; }
+.info-grid dd { font-size: 14px; font-weight: 500; }
+
+/* ---- Messages container ---- */
+.messages { flex: 1; min-width: 0; padding: 20px; }
+
+/* ---- Message blocks ---- */
+.msg { margin-bottom: 16px; border-radius: 8px; border: 1px solid #30363d; overflow: hidden; }
+.msg-header { padding: 8px 14px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.msg-header .arrow { transition: transform .15s; font-size: 11px; color: #8b949e; }
+.msg-header .arrow.open { transform: rotate(90deg); }
+.msg-body { display: none; padding: 0 14px 12px; }
+.msg-body.open { display: block; }
+
+/* System */
+.msg-system .msg-header { background: #1c2128; color: #8b949e; }
+/* User */
+.msg-user .msg-header { background: #0d1f3c; color: #58a6ff; }
+.msg-user { border-left: 3px solid #1f6feb; }
+/* Step (assistant + tool) */
+.msg-step .msg-header { background: #1a1e24; color: #7ee787; }
+/* Exit */
+.msg-exit .msg-header { background: #261c1c; color: #f0883e; }
+
+/* ---- Code / pre blocks ---- */
+pre, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+.output-block { max-height: 400px; overflow-y: auto; }
+.output-block.expanded { max-height: none; }
+.expand-btn { background: none; border: none; color: #58a6ff; cursor: pointer; font-size: 12px; padding: 4px 0; }
+
+/* Thinking block */
+.thinking { background: #1c2128; border-left: 3px solid #484f58; padding: 10px 14px; margin-bottom: 10px; border-radius: 4px; font-style: italic; color: #8b949e; font-size: 13px; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; position: relative; }
+.thinking.expanded { max-height: none; }
+
+/* Tool call label */
+.tool-label { display: inline-block; background: #1f6feb33; color: #58a6ff; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-bottom: 6px; }
+.tool-args { margin-top: 4px; }
+
+/* Return code */
+.rc { display: inline-block; font-size: 12px; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-bottom: 6px; }
+.rc-ok { background: #238636; color: #fff; }
+.rc-err { background: #da3633; color: #fff; }
+
+/* Diff highlighting */
+.diff-line-add { color: #7ee787; }
+.diff-line-del { color: #ff7b72; }
+.diff-line-hunk { color: #d2a8ff; }
+.diff-line-file { color: #58a6ff; font-weight: 600; }
+
+/* No output placeholder */
+.no-output { color: #484f58; font-style: italic; font-size: 13px; padding: 8px 0; }
+
+/* Loading */
+.loading { text-align: center; padding: 60px; color: #8b949e; font-size: 16px; }
+/* Error */
+.error-banner { background: #da363333; color: #ff7b72; border: 1px solid #da3633; border-radius: 8px; padding: 16px; margin: 20px; text-align: center; }
+
+/* Trace content wrapper (step-nav + messages side by side) */
+.trace-wrapper { display: flex; max-width: 1060px; margin: 0 auto; }
+
+/* Step navigation bar */
+.step-nav { position: sticky; top: 60px; align-self: flex-start; flex-shrink: 0; width: 80px; display: flex; flex-direction: column; gap: 1px; padding: 6px 6px; background: #161b22; border: 1px solid #30363d; border-left: none; border-radius: 0 6px 6px 0; max-height: calc(100vh - 80px); overflow-y: auto; scrollbar-width: none; }
+.step-nav::-webkit-scrollbar { display: none; }
+.step-nav:empty { display: none; }
+.step-nav .sn-item { padding: 2px 10px; font-size: 12px; color: #8b949e; cursor: pointer; border-radius: 3px; transition: background .1s, color .1s; flex-shrink: 0; white-space: nowrap; }
+.step-nav .sn-item:hover { background: #30363d; color: #c9d1d9; }
+.step-nav .sn-item.active { background: #1f6feb; color: #fff; }
+.step-nav .sn-item.sn-system { color: #8b949e; }
+.step-nav .sn-item.sn-user { color: #58a6ff; }
+.step-nav .sn-item.sn-step { color: #7ee787; }
+.step-nav .sn-item.sn-exit { color: #f0883e; }
+
+.btn-top { position: fixed; bottom: 24px; right: 24px; z-index: 100; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background .15s, opacity .2s; opacity: 0; pointer-events: none; }
+.btn-top.visible { opacity: 1; pointer-events: auto; }
+.btn-top:hover { background: #30363d; color: #e6edf3; }
+</style>
+</head>
+<body>
+
+<div class="topbar" id="topbar">
+  <a class="nav-btn" id="btn-back" href="javascript:history.back()">Back to Dashboard</a>
+  <span class="instance-id" id="instance-id"></span>
+  <span id="status-badge"></span>
+</div>
+
+<div class="info-panel" id="info-panel">
+  <button class="info-toggle" id="info-toggle">&#9654; Run Info</button>
+  <div class="info-body" id="info-body">
+    <dl class="info-grid" id="info-grid"></dl>
+  </div>
+</div>
+
+<div class="trace-wrapper">
+  <div class="step-nav" id="step-nav"></div>
+  <div class="messages" id="messages">
+    <div class="loading">Loading trace...</div>
+  </div>
+</div>
+<button class="btn-top" id="btn-top" title="Back to top">Top</button>
+
+<script>
+// ---- DOM refs ----
+const $messages = document.getElementById("messages");
+const $instanceId = document.getElementById("instance-id");
+const $statusBadge = document.getElementById("status-badge");
+const $infoToggle = document.getElementById("info-toggle");
+const $infoBody = document.getElementById("info-body");
+const $infoGrid = document.getElementById("info-grid");
+const $stepNav = document.getElementById("step-nav");
+const $btnTop = document.getElementById("btn-top");
+
+// ---- Info panel toggle ----
+$infoToggle.addEventListener("click", () => {
+  const open = $infoBody.classList.toggle("open");
+  $infoToggle.innerHTML = (open ? "&#9660;" : "&#9654;") + " Run Info";
+});
+
+// ---- Back to top button ----
+window.addEventListener("scroll", () => {
+  $btnTop.classList.toggle("visible", window.scrollY > 400);
+});
+$btnTop.addEventListener("click", () => window.scrollTo({top: 0, behavior: "smooth"}));
+
+// ---- Derive API base (works under /dashboard/ mount) ----
+const PAGE_URL = window.location.href;
+const traceIdx = PAGE_URL.indexOf("/trace");
+const API_BASE = traceIdx >= 0 ? PAGE_URL.substring(0, traceIdx) : "";
+
+// ---- Load trajectory ----
+async function init() {
+  const params = new URLSearchParams(window.location.search);
+  const trialDir = params.get("trial_dir");
+  if (!trialDir) {
+    $messages.innerHTML = '<div class="error-banner">No trial_dir specified in URL.</div>';
+    return;
+  }
+
+  try {
+    const resp = await fetch(API_BASE + "/api/trace?trial_dir=" + encodeURIComponent(trialDir));
+    const data = await resp.json();
+    if (data.error) {
+      $messages.innerHTML = `<div class="error-banner">${esc(data.error)}</div>`;
+      return;
+    }
+    document.title = `Trace: ${data.instance_id || trialDir}`;
+    renderTrajectory(data);
+  } catch (e) {
+    $messages.innerHTML = `<div class="error-banner">Failed to load trace: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---- Timing helpers ----
+function fmtDur(secs) {
+  if (secs === null || secs === undefined) return "-";
+  const rounded = Math.round(secs);
+  if (rounded < 60) return secs.toFixed(1) + "s";
+  const m = Math.floor(rounded / 60);
+  const s = rounded - m * 60;
+  return m + "m " + s + "s";
+}
+
+const TIMING_LABELS = [
+  ["total_time", "Total Time"],
+  ["env_setup_time", "Env Setup"],
+  ["agent_setup_time", "Agent Setup"],
+  ["agent_run_time", "Agent Run"],
+  ["tool_exec_time", "↳ Tool Exec"],
+  ["llm_wait_time", "↳ LLM Wait"],
+  ["eval_time", "Grading"],
+];
+
+function timingRows(timing) {
+  if (!timing) return "";
+  return TIMING_LABELS
+    .filter(([key]) => timing[key] !== undefined)
+    .map(([key, label]) => `<dt>${label}</dt><dd>${fmtDur(timing[key])}</dd>`)
+    .join("");
+}
+
+// ---- Render ----
+function renderTrajectory(data) {
+  // Header
+  $instanceId.textContent = data.instance_id || "";
+  const status = (data.info?.exit_status || "unknown").toLowerCase();
+  const statusLabel = data.info?.exit_status || "unknown";
+  let badgeHtml = `<span class="badge badge-${status.replace(/[^a-z]/g, '')}">${esc(statusLabel)}</span>`;
+  if (data.reward !== null && data.reward !== undefined) {
+    const rwClass = data.reward === 1 ? 'badge-completed' : 'badge-error';
+    badgeHtml += ` <span class="badge ${rwClass}">Reward: ${parseFloat(data.reward.toFixed(3))}</span>`;
+  }
+  $statusBadge.innerHTML = badgeHtml;
+
+  // Info panel
+  const stats = data.info?.model_stats || {};
+  function fmtNum(n) {
+    if (n === null || n === undefined) return "-";
+    return n.toLocaleString();
+  }
+  $infoGrid.innerHTML = `
+    <dt>Exit Status</dt><dd>${esc(statusLabel)}</dd>
+    <dt>Reward</dt><dd>${data.reward !== null && data.reward !== undefined ? data.reward : '-'}</dd>
+    <dt>Steps</dt><dd>${fmtNum(stats.api_calls)}</dd>
+    <dt>Decoded Tokens</dt><dd>${fmtNum(stats.completion_tokens)}</dd>
+    <dt>Total Tokens</dt><dd>${fmtNum(stats.total_tokens)}</dd>
+    <dt>Format</dt><dd>${esc(data.trajectory_format || "-")}</dd>
+    <dt>Agent Version</dt><dd>${esc(data.info?.mini_version || "-")}</dd>
+    ${timingRows(data.timing)}
+  `;
+
+  // Messages
+  const msgs = data.messages || [];
+  let html = "";
+  let i = 0;
+  let stepCounter = 0;
+  const navItems = [];
+
+  while (i < msgs.length) {
+    const m = msgs[i];
+
+    if (m.role === "system") {
+      html += renderCollapsible("msg-system", "System Prompt", formatContent(m.content), false, "nav-sys");
+      navItems.push({id: "nav-sys", label: "System", type: "system"});
+      i++;
+    } else if (m.role === "user") {
+      const isToolError = typeof m.content === "string" && m.content.startsWith("Tool call error:");
+      const userLabel = isToolError ? "Tool Call Error" : "User / Task";
+      const navLabel = isToolError ? "Error" : "Task";
+      const navId = isToolError ? `nav-toolerr-${i}` : "nav-user";
+      const msgCls = isToolError ? "msg-exit" : "msg-user";
+      html += renderCollapsible(msgCls, userLabel, formatContent(m.content), !isToolError, navId);
+      navItems.push({id: navId, label: navLabel, type: isToolError ? "exit" : "user"});
+      i++;
+    } else if (m.role === "assistant") {
+      stepCounter++;
+      const stepNum = stepCounter;
+      let body = "";
+
+      // Reasoning / thinking
+      if (m.reasoning_content) {
+        const thinkId = `think-${i}`;
+        body += `<span class="tool-label" style="background:#f0883e33;color:#f0883e;margin-top:8px;display:inline-block;">Thinking</span>`;
+        body += `<div class="thinking" id="${thinkId}">${esc(m.reasoning_content)}</div>`;
+        body += `<button class="expand-btn overflow-btn" data-target="${thinkId}" data-cls="thinking" style="display:none" onclick="toggleExpand('${thinkId}', this, 'thinking')">Show full thinking</button>`;
+      }
+
+      // Tool calls
+      if (m.tool_calls && m.tool_calls.length) {
+        body += `<div style="margin-top:8px;">`;
+        m.tool_calls.forEach(tc => {
+          const fname = tc.function?.name || "unknown";
+          let args = tc.function?.arguments || "";
+          let display = args;
+          try {
+            const parsed = JSON.parse(args);
+            if (parsed.command !== undefined) {
+              display = parsed.command;
+            } else {
+              display = JSON.stringify(parsed, null, 2);
+            }
+          } catch {}
+          body += `<span class="tool-label">${esc(fname)}</span>`;
+          body += `<pre class="tool-args">${esc(display)}</pre>`;
+        });
+        body += `</div>`;
+      }
+
+      // Content
+      if (m.content && m.content !== "None" && m.content !== null) {
+        body += `<div style="margin-top:8px;">${formatContent(m.content)}</div>`;
+      }
+
+      // Consume following tool messages
+      let toolHtml = "";
+      let j = i + 1;
+      while (j < msgs.length && msgs[j].role === "tool") {
+        const tm = msgs[j];
+        const parsed = parseToolContent(tm.content || "");
+        const rcClass = parsed.returncode === "0" ? "rc-ok" : "rc-err";
+        const outId = `out-${j}`;
+        const outputTrimmed = parsed.output.trim();
+        toolHtml += `<div style="margin-top:10px;">`;
+        toolHtml += `<span class="rc ${rcClass}">Return Code: ${esc(parsed.returncode)}</span>`;
+        if (outputTrimmed) {
+          toolHtml += `<pre class="output-block" id="${outId}">${esc(parsed.output)}</pre>`;
+          toolHtml += `<button class="expand-btn overflow-btn" data-target="${outId}" data-cls="output-block" style="display:none" onclick="toggleExpand('${outId}', this, 'output-block')">Show all output</button>`;
+        } else {
+          toolHtml += `<div class="no-output">No output</div>`;
+        }
+        toolHtml += `</div>`;
+        j++;
+      }
+      body += toolHtml;
+
+      const stepId = `nav-step-${stepNum}`;
+      html += renderCollapsible("msg-step", `Step ${stepNum}`, body, true, stepId);
+      navItems.push({id: stepId, label: `Step ${stepNum}`, type: "step"});
+      i = j;
+    } else if (m.role === "exit") {
+      const diffHtml = m.content ? `<pre>${highlightDiff(m.content)}</pre>` : "<p>No output.</p>";
+      html += renderCollapsible("msg-exit", "Exit / Final Diff", diffHtml, true, "nav-exit");
+      navItems.push({id: "nav-exit", label: "Exit", type: "exit"});
+      i++;
+    } else {
+      html += renderCollapsible("msg-system", m.role, formatContent(m.content), false);
+      i++;
+    }
+  }
+
+  $messages.innerHTML = html;
+  showOverflowButtons();
+  buildStepNav(navItems);
+  window.scrollTo(0, 0);
+}
+
+function renderCollapsible(cls, title, bodyHtml, startOpen, id) {
+  const openCls = startOpen ? "open" : "";
+  const idAttr = id ? ` id="${id}"` : "";
+  return `
+    <div class="msg ${cls}"${idAttr}>
+      <div class="msg-header" onclick="toggleMsg(this)">
+        <span class="arrow ${openCls}">&#9654;</span> ${esc(title)}
+      </div>
+      <div class="msg-body ${openCls}">${bodyHtml}</div>
+    </div>`;
+}
+
+function toggleMsg(header) {
+  const arrow = header.querySelector(".arrow");
+  const body = header.nextElementSibling;
+  arrow.classList.toggle("open");
+  body.classList.toggle("open");
+  if (body.classList.contains("open")) {
+    requestAnimationFrame(() => {
+      body.querySelectorAll('.overflow-btn').forEach(btn => {
+        const el = document.getElementById(btn.dataset.target);
+        if (el && el.scrollHeight > el.clientHeight + 1) {
+          btn.style.display = '';
+        }
+      });
+    });
+  }
+}
+
+function showOverflowButtons() {
+  document.querySelectorAll('.overflow-btn').forEach(btn => {
+    const el = document.getElementById(btn.dataset.target);
+    if (el && el.scrollHeight > el.clientHeight + 1) {
+      btn.style.display = '';
+    } else {
+      btn.style.display = 'none';
+    }
+  });
+}
+
+function toggleExpand(elemId, btn, cls) {
+  const el = document.getElementById(elemId);
+  const expanding = !el.classList.contains("expanded");
+  el.classList.toggle("expanded");
+  if (expanding) {
+    btn.textContent = "Collapse";
+  } else {
+    btn.textContent = cls === "thinking" ? "Show full thinking" : "Show all output";
+    requestAnimationFrame(() => {
+      if (el.scrollHeight <= el.clientHeight + 1) btn.style.display = 'none';
+    });
+  }
+}
+
+// ---- Step navigation bar ----
+let _navObserver = null;
+
+function buildStepNav(navItems) {
+  if (_navObserver) { _navObserver.disconnect(); _navObserver = null; }
+  if (!navItems.length) { $stepNav.innerHTML = ""; return; }
+
+  let html = "";
+  navItems.forEach(item => {
+    html += `<div class="sn-item sn-${item.type}" data-target="${item.id}">${item.label}</div>`;
+  });
+  $stepNav.innerHTML = html;
+
+  const allItems = $stepNav.querySelectorAll(".sn-item");
+  const targetIds = navItems.map(n => n.id);
+
+  let _clickedTarget = null;
+  let _clickScrollTimer = null;
+
+  $stepNav.querySelectorAll(".sn-item").forEach(el => {
+    el.addEventListener("click", () => {
+      const target = document.getElementById(el.dataset.target);
+      if (target) {
+        _clickedTarget = el.dataset.target;
+        allItems.forEach(e => e.classList.toggle("active", e.dataset.target === _clickedTarget));
+        el.scrollIntoView({block: "nearest", behavior: "auto"});
+        const y = target.getBoundingClientRect().top + window.scrollY - 60;
+        window.scrollTo({top: y, behavior: "instant"});
+        clearTimeout(_clickScrollTimer);
+        _clickScrollTimer = setTimeout(() => { _clickedTarget = null; }, 300);
+      }
+    });
+  });
+
+  _navObserver = new IntersectionObserver(entries => {
+    if (_clickedTarget) return;
+    let topId = null;
+    let topY = Infinity;
+    const topBarH = 70;
+    const atBottom = (window.innerHeight + window.scrollY) >= document.body.scrollHeight - 5;
+    if (atBottom && targetIds.length) {
+      topId = targetIds[targetIds.length - 1];
+    } else {
+      targetIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom > topBarH && rect.top < window.innerHeight && rect.top < topY) {
+          topY = rect.top;
+          topId = id;
+        }
+      });
+    }
+    allItems.forEach(el => {
+      el.classList.toggle("active", el.dataset.target === topId);
+    });
+    const activeEl = $stepNav.querySelector(".sn-item.active");
+    if (activeEl) {
+      activeEl.scrollIntoView({block: "nearest", behavior: "auto"});
+    }
+  }, {threshold: 0});
+
+  targetIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) _navObserver.observe(el);
+  });
+}
+
+// ---- Utilities ----
+function esc(str) {
+  if (str == null) return "";
+  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function formatContent(content) {
+  if (content == null) return "<em>null</em>";
+  if (typeof content === "string") return `<pre style="white-space:pre-wrap;word-break:break-word;border:none;background:transparent;padding:0;">${esc(content)}</pre>`;
+  if (Array.isArray(content)) return content.map(c => typeof c === "string" ? esc(c) : `<pre>${esc(JSON.stringify(c, null, 2))}</pre>`).join("");
+  return `<pre>${esc(JSON.stringify(content, null, 2))}</pre>`;
+}
+
+function parseToolContent(raw) {
+  const rcMatch = raw.match(/<returncode>(.*?)<\/returncode>/s);
+  const outMatch = raw.match(/<output>([\s\S]*?)<\/output>/s);
+  return {
+    returncode: rcMatch ? rcMatch[1].trim() : "?",
+    output: outMatch ? outMatch[1] : raw,
+  };
+}
+
+function highlightDiff(text) {
+  return text.split("\n").map(line => {
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ")) {
+      return `<span class="diff-line-file">${esc(line)}</span>`;
+    } else if (line.startsWith("@@")) {
+      return `<span class="diff-line-hunk">${esc(line)}</span>`;
+    } else if (line.startsWith("+")) {
+      return `<span class="diff-line-add">${esc(line)}</span>`;
+    } else if (line.startsWith("-")) {
+      return `<span class="diff-line-del">${esc(line)}</span>`;
+    }
+    return esc(line);
+  }).join("\n");
+}
+
+// ---- Boot ----
+init();
+</script>
+</body>
+</html>

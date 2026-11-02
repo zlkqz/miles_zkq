@@ -59,6 +59,7 @@
        "user-guide/fully-async",
        "user-guide/training-backend",
        "user-guide/monitoring",
+       "seta_wandb_metrics",
        "user-guide/customization",
        "user-guide/generate-endpoint",
        "user-guide/agentic-rollout",

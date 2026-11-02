@@ -1,0 +1,24 @@
+{
+  "tasks_source": "/ceph_home/zhangkaiqi2024/seta_miles_data/tasks",
+  "endpoints_file": "seta_miles_runtime/remote/endpoints.json",
+  "python_version": "3.13.16",
+  "crane_version": "v0.22.1",
+  "nodes": [
+    {
+      "name": "sandbox-144",
+      "ssh": "zhangkaiqi2024@124.16.138.144",
+      "host": "124.16.138.144",
+      "root": "/opt/seta-zhangkaiqi2024",
+      "port": 18080,
+      "service_name": "seta-harbor-zkq",
+      "service_user": "seta-sandbox-zkq",
+      "service_id": "zkq",
+      "max_concurrent": 32,
+      "image_cache_keep": 16,
+      "proxy": "http://124.16.138.150:7890",
+      "no_proxy": ["124.16.138.144"],
+      "registry_mirrors": ["docker.m.daocloud.io"],
+      "token_file": "seta_miles_runtime/secrets/remote-token"
+    }
+  ]
+}

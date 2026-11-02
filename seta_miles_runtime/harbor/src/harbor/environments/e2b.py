@@ -1,0 +1,681 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path, PurePosixPath
+from typing import override
+
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random_exponential,
+)
+
+from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.environments.capabilities import (
+    EnvironmentCapabilities,
+    EnvironmentResourceCapabilities,
+)
+from harbor.environments.definition import (
+    SNAPSHOT_HASH_LEN,
+    effective_exec_cwd,
+    parse_dockerfile_workdir,
+    require_agent_environment_definition,
+)
+from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
+from harbor.models.trial.paths import TrialPaths
+from harbor.utils.optional_import import MissingExtraError
+
+try:
+    import httpx
+    from e2b import (
+        ALL_TRAFFIC,
+        AsyncSandbox,
+        AsyncTemplate,
+        FileType,
+        SandboxNetworkOpts,
+        Template,
+    )
+    from e2b.exceptions import NotFoundException, RateLimitException
+    from e2b.sandbox.commands.command_handle import CommandExitException
+    from e2b.sandbox.filesystem.filesystem import WriteEntry
+    from e2b.sandbox.sandbox_api import SandboxNetworkUpdate
+    from e2b.sandbox_async.commands.command_handle import AsyncCommandHandle
+
+    try:
+        from e2b.exceptions import ServiceBusyException
+
+        _SERVICE_BUSY: tuple[type[BaseException], ...] = (ServiceBusyException,)
+    except ImportError:
+        # e2b before 2.48 reports a 503 as a plain SandboxException, which
+        # cannot be told apart from the other 5xx and is therefore not retried.
+        _SERVICE_BUSY = ()
+
+    # Retry only failures that prove the command never reached the daemon, so
+    # replay cannot duplicate side effects: a 429 is rejected before envd spawns
+    # anything. A command is dispatched over the SDK's connectrpc client, whose
+    # transport already retries a connection it failed to establish.
+    _DISPATCH_RETRYABLE: tuple[type[BaseException], ...] = (RateLimitException,)
+
+    # Retry a create only after failures that prove no sandbox was made, so a
+    # retry cannot leave a second one running: connection-establishment errors
+    # (no request bytes sent yet), 429s, and 503s, which the SDK itself retries
+    # for every request, creates included. The SDK creates through its httpx
+    # client, so these are httpx's classes, not httpcore's. Any other 5xx, a
+    # 502 from a gateway included, can follow a create the service carried out.
+    _CREATE_RETRYABLE: tuple[type[BaseException], ...] = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+        RateLimitException,
+        *_SERVICE_BUSY,
+    )
+
+    _HAS_E2B = True
+except ImportError:
+    _HAS_E2B = False
+    # The @retry decorator below references this at class-definition time, so it
+    # must exist even without the e2b extra.
+    _DISPATCH_RETRYABLE: tuple[type[BaseException], ...] = ()
+    _CREATE_RETRYABLE: tuple[type[BaseException], ...] = ()
+    _SERVICE_BUSY: tuple[type[BaseException], ...] = ()
+
+
+# How long a create keeps retrying while the service answers 503. A 503 asks
+# the client to come back, which during a restart or failover takes minutes;
+# the other retryable errors get one more attempt.
+_SERVICE_BUSY_RETRY_SEC = 300
+
+
+def _stop_create_retry(retry_state: RetryCallState) -> bool:
+    error = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(error, _SERVICE_BUSY):
+        elapsed = retry_state.seconds_since_start
+        return elapsed is not None and elapsed >= _SERVICE_BUSY_RETRY_SEC
+    return retry_state.attempt_number >= 2
+
+
+def _log_create_retry(retry_state: RetryCallState) -> None:
+    env = retry_state.args[0]
+    error = retry_state.outcome.exception() if retry_state.outcome else None
+    env.logger.warning(f"E2B sandbox creation failed, retrying: {error}")
+
+
+class E2BEnvironment(BaseEnvironment):
+    _UPLOAD_BATCH_SIZE = 20
+    # How long exec keeps reconnecting after each drop of a command's output
+    # stream: it bounds how long the sandbox may stay unreachable, while
+    # timeout_sec still bounds the whole command.
+    _RECONNECT_WINDOW_SEC = 300.0
+
+    @classmethod
+    @override
+    def preflight(cls) -> None:
+        import os
+
+        if not os.environ.get("E2B_API_KEY"):
+            raise SystemExit(
+                "E2B requires E2B_API_KEY to be set. "
+                "Please set this environment variable and try again."
+            )
+
+    def __init__(
+        self,
+        environment_dir: Path,
+        environment_name: str,
+        session_id: str,
+        trial_paths: TrialPaths,
+        task_env_config: EnvironmentConfig,
+        *args,
+        prebuilt_template_id: str | None = None,
+        sandbox_timeout_secs: int = 60 * 60,
+        renew_interval: float = 600.0,
+        **kwargs,
+    ):
+        """
+        Args:
+            sandbox_timeout_secs: How long the sandbox stays alive without a
+                renewal. The sandbox is created with this timeout and the
+                timeout is renewed every ``renew_interval`` seconds while the
+                environment is running, so a sandbox left behind by a Harbor
+                process that died before ``stop()`` expires within this long.
+            renew_interval: Seconds between timeout renewals; must be shorter
+                than ``sandbox_timeout_secs``. ``0`` disables renewal, and the
+                sandbox then expires ``sandbox_timeout_secs`` after creation.
+        """
+        if sandbox_timeout_secs <= 0:
+            raise ValueError("sandbox_timeout_secs must be positive")
+        if renew_interval < 0 or renew_interval >= sandbox_timeout_secs:
+            raise ValueError(
+                "renew_interval must be 0 (no renewal) or shorter than "
+                "sandbox_timeout_secs"
+            )
+        if prebuilt_template_id is not None and (
+            not isinstance(prebuilt_template_id, str)
+            or not prebuilt_template_id.strip()
+            or prebuilt_template_id != prebuilt_template_id.strip()
+        ):
+            raise ValueError("prebuilt_template_id must be a non-empty, trimmed string")
+        if not _HAS_E2B:
+            raise MissingExtraError(package="e2b", extra="e2b")
+
+        super().__init__(
+            environment_dir=environment_dir,
+            environment_name=environment_name,
+            session_id=session_id,
+            trial_paths=trial_paths,
+            task_env_config=task_env_config,
+            **kwargs,
+        )
+
+        self._workdir = parse_dockerfile_workdir(self._environment_definition_path)
+
+        self._sandbox: AsyncSandbox | None = None
+        self._sandbox_timeout_secs = sandbox_timeout_secs
+        self._renew_interval = renew_interval
+        self._renew_task: asyncio.Task[None] | None = None
+        self._prebuilt_template_id = prebuilt_template_id
+        env_hash = self.environment_id[:SNAPSHOT_HASH_LEN]
+        self._template_name = f"{environment_name}__{env_hash}".replace(
+            "/", "__"
+        ).replace(".", "-")
+
+    @staticmethod
+    @override
+    def type() -> EnvironmentType:
+        return EnvironmentType.E2B
+
+    @classmethod
+    @override
+    def resource_capabilities(cls) -> EnvironmentResourceCapabilities:
+        return EnvironmentResourceCapabilities(
+            cpu_request=True,
+            memory_request=True,
+        )
+
+    @property
+    @override
+    def capabilities(self) -> EnvironmentCapabilities:
+        # E2B supports domain allowlists at sandbox creation and runtime switching
+        # via AsyncSandbox.update_network().
+        return EnvironmentCapabilities(
+            disable_internet=True,
+            network_allowlist=True,
+            network_allowlist_hostnames=True,
+            network_allowlist_wildcard_hostnames=True,
+            network_allowlist_ipv4_addresses=True,
+            network_allowlist_ipv6_addresses=False,
+            network_allowlist_ipv4_cidrs=False,
+            network_allowlist_ipv6_cidrs=False,
+            dynamic_network_policy=True,
+        )
+
+    def _sandbox_network_update(
+        self, network_policy: NetworkPolicy | None = None
+    ) -> SandboxNetworkUpdate:
+        network_policy = network_policy or self.network_policy
+        if network_policy.network_mode == NetworkMode.PUBLIC:
+            return {}
+        if network_policy.network_mode == NetworkMode.NO_NETWORK:
+            return {"allow_internet_access": False}
+        return {
+            "allow_out": list(network_policy.allowed_hosts),
+            "deny_out": [ALL_TRAFFIC],
+        }
+
+    def _sandbox_create_network_options(
+        self, network_policy: NetworkPolicy | None = None
+    ) -> SandboxNetworkOpts | None:
+        network_policy = network_policy or self.network_policy
+        if network_policy.network_mode != NetworkMode.ALLOWLIST:
+            return None
+        return {
+            "allow_out": list(network_policy.allowed_hosts),
+            "deny_out": [ALL_TRAFFIC],
+        }
+
+    @property
+    def _environment_definition_path(self) -> Path:
+        return self.environment_dir / "Dockerfile"
+
+    @override
+    def _validate_definition(self):
+        require_agent_environment_definition(
+            self.environment_dir,
+            docker_image=self.task_env_config.docker_image,
+        )
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    async def _create_template(self):
+        if self.task_env_config.docker_image:
+            template = Template().from_image(
+                image=self.task_env_config.docker_image,
+            )
+        else:
+            template = Template(
+                file_context_path=str(self.environment_dir),
+            ).from_dockerfile(
+                dockerfile_content_or_path=str(self._environment_definition_path),
+            )
+
+        cpus = self._effective_cpus
+        memory_mb = self._effective_memory_mb
+        if cpus is not None and memory_mb is not None:
+            await AsyncTemplate.build(
+                template=template,
+                alias=self._template_name,
+                cpu_count=cpus,
+                memory_mb=memory_mb,
+            )
+        elif cpus is not None:
+            await AsyncTemplate.build(
+                template=template,
+                alias=self._template_name,
+                cpu_count=cpus,
+            )
+        elif memory_mb is not None:
+            await AsyncTemplate.build(
+                template=template,
+                alias=self._template_name,
+                memory_mb=memory_mb,
+            )
+        else:
+            await AsyncTemplate.build(template=template, alias=self._template_name)
+
+    @retry(
+        retry=retry_if_exception_type(_CREATE_RETRYABLE),
+        stop=_stop_create_retry,
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        before_sleep=_log_create_retry,
+        reraise=True,
+    )
+    async def _create_sandbox(self):
+        metadata = {
+            "environment_name": self.environment_name,
+            "session_id": self.session_id,
+        }
+
+        self._sandbox = await AsyncSandbox.create(
+            template=self._prebuilt_template_id or self._template_name,
+            metadata=metadata,
+            envs=self._startup_env(),
+            timeout=self._sandbox_timeout_secs,
+            allow_internet_access=(
+                self.network_policy.network_mode != NetworkMode.NO_NETWORK
+            ),
+            network=self._sandbox_create_network_options(),
+        )
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        await self._sandbox.update_network(self._sandbox_network_update(network_policy))
+
+    async def _does_template_exist(self) -> bool:
+        return await AsyncTemplate.alias_exists(self._template_name)
+
+    @override
+    async def start(self, force_build: bool):
+        if self._prebuilt_template_id is not None and force_build:
+            raise ValueError("force_build cannot be combined with prebuilt_template_id")
+        if self._prebuilt_template_id is None and (
+            force_build or not await self._does_template_exist()
+        ):
+            self.logger.debug(f"Creating template {self._template_name}")
+
+            await self._create_template()
+
+        await self._create_sandbox()
+
+        if not self._sandbox:
+            raise RuntimeError(
+                "Sandbox not found but was just created. This should never happen."
+            )
+
+        if self._renew_interval > 0:
+            self._renew_task = asyncio.create_task(self._renew_loop())
+
+        await self.ensure_dirs(self._mount_targets(writable_only=True))
+
+        await self._upload_environment_dir_after_start()
+
+    async def _renew_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._renew_interval)
+            sandbox = self._sandbox
+            if sandbox is None:
+                return
+            try:
+                await sandbox.set_timeout(self._sandbox_timeout_secs)
+            except Exception as exc:
+                self.logger.warning(f"E2B sandbox timeout renewal failed: {exc}")
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    async def _stop_sandbox(self):
+        if self._sandbox:
+            await self._sandbox.kill()
+
+    @override
+    async def stop(self, delete: bool):
+        """Stops the environment and optionally deletes it."""
+        if not delete:
+            self.logger.debug(
+                "E2B harbor are ephemeral and will be deleted after use, "
+                "regardless of delete=False."
+            )
+
+        if self._renew_task is not None:
+            self._renew_task.cancel()
+            self._renew_task = None
+
+        if self._sandbox:
+            try:
+                await self._stop_sandbox()
+            except Exception as e:
+                self.logger.error(f"Error stopping sandbox: {e}")
+            finally:
+                self._sandbox = None
+        else:
+            self.logger.debug("Sandbox has already been removed.")
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def upload_file(self, source_path: Path | str, target_path: str):
+        """
+        Adds a local file to the environment.
+
+        Args:
+            source_path: The path to the source local file.
+            target_path: The path to which to copy the file.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        await self._sandbox.files.write(target_path, Path(source_path).read_bytes())
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def upload_dir(self, source_dir: Path | str, target_dir: str):
+        """
+        Adds a local directory to the environment.
+
+        Args:
+            source_dir: The path to the source local directory.
+            target_dir: The path to which to copy the directory.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        files: list[WriteEntry] = []
+        for file_path in Path(source_dir).rglob("*"):
+            if file_path.is_file():
+                files.append(
+                    WriteEntry(
+                        path=str(
+                            PurePosixPath(target_dir)
+                            / file_path.relative_to(Path(source_dir)).as_posix()
+                        ),
+                        data=file_path.read_bytes(),
+                    )
+                )
+
+        if files:
+            for i in range(0, len(files), self._UPLOAD_BATCH_SIZE):
+                batch = files[i : i + self._UPLOAD_BATCH_SIZE]
+                await self._sandbox.files.write_files(batch)
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def download_file(self, source_path: str, target_path: Path | str):
+        """
+        Downloads a file from the environment to the local machine.
+
+        Args:
+            source_path: The path to the source file in the environment.
+            target_path: The local path to which to copy the file.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        Path(target_path).write_bytes(
+            await self._sandbox.files.read(source_path, format="bytes"),
+        )
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def download_dir(self, source_dir: str, target_dir: Path | str):
+        """
+        Downloads a directory from the environment to the local machine. This overwrites
+        existing files in the target directory.
+
+        Args:
+            source_dir: The path to the source directory in the environment.
+            target_dir: The local path to which to copy the directory.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        results = await self._sandbox.files.list(source_dir)
+
+        for result in results:
+            if result.type == FileType.DIR:
+                sub_target_dir = Path(target_dir) / Path(result.path).relative_to(
+                    Path(source_dir)
+                )
+                sub_target_dir.mkdir(parents=True, exist_ok=True)
+
+                await self.download_dir(
+                    source_dir=result.path,
+                    target_dir=sub_target_dir,
+                )
+
+            if result.type == FileType.FILE:
+                target_path = Path(target_dir) / Path(result.path).relative_to(
+                    Path(source_dir)
+                )
+
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                await self.download_file(
+                    source_path=result.path,
+                    target_path=str(target_path),
+                )
+
+    @override
+    async def is_dir(self, path: str, user: str | int | None = None) -> bool:
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        info = await self._sandbox.files.get_info(path)
+        return info.type == FileType.DIR
+
+    @override
+    async def is_file(self, path: str, user: str | int | None = None) -> bool:
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        info = await self._sandbox.files.get_info(path)
+        return info.type == FileType.FILE
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(_DISPATCH_RETRYABLE),
+        reraise=True,
+    )
+    async def _dispatch_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_sec: int | None,
+        user: str,
+    ) -> tuple[AsyncCommandHandle, float]:
+        """Start ``command`` in the background; return its handle and the event
+        loop time the successful attempt began, when ``timeout_sec`` starts.
+
+        Retries only ``_DISPATCH_RETRYABLE`` failures; once a pid exists the
+        command is running, so re-dispatch would duplicate side effects.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        started_at = asyncio.get_running_loop().time()
+        handle = await self._sandbox.commands.run(
+            cmd=command,
+            background=True,
+            cwd=cwd,
+            envs=env,
+            timeout=timeout_sec or 0,
+            user=user,
+        )
+        return handle, started_at
+
+    @override
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        """
+        Executes a command in the environment.
+
+        Args:
+            command: The command to execute.
+            cwd: The working directory in which to execute the command.
+            env: The environment  variables to set.
+            timeout_sec: The timeout in seconds.
+            user: Username or UID to run the command as. None falls back to
+                ``self.default_user``; if that is also None the sandbox default is used.
+        """
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+
+        handle, started_at = await self._dispatch_command(
+            command,
+            cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, self._workdir),
+            env=env,
+            timeout_sec=timeout_sec,
+            user=str(user) if user is not None else "root",
+        )
+        deadline = started_at + timeout_sec if timeout_sec else None
+
+        # The command keeps running on the daemon when its output stream
+        # drops, so reconnect to it rather than fail the call or re-dispatch
+        # and double-execute. A non-zero exit is a real result.
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        while True:
+            try:
+                result = await handle.wait()
+                break
+            except CommandExitException as e:
+                result = e
+                break
+            except Exception as e:
+                stream_error = e
+            stdout_parts.append(handle.stdout)
+            stderr_parts.append(handle.stderr)
+            handle = await self._reconnect(handle.pid, stream_error, deadline)
+
+        return ExecResult(
+            stdout="".join(stdout_parts) + result.stdout,
+            stderr="".join(stderr_parts) + result.stderr,
+            return_code=result.exit_code,
+        )
+
+    async def _reconnect(
+        self, pid: int, stream_error: Exception, deadline: float | None
+    ) -> AsyncCommandHandle:
+        """Reconnect to command ``pid`` after its stream failed with ``stream_error``.
+
+        Retries until a reconnect succeeds. Raises ``stream_error`` instead once
+        the command's ``deadline`` or ``_RECONNECT_WINDOW_SEC`` passes, the
+        environment is stopped, the daemon no longer knows the process (it
+        ended while disconnected), or the sandbox reports itself gone. The
+        daemon does not replay output written while disconnected, so the
+        caller's stdout and stderr miss that part; the exit code is exact.
+        """
+        loop = asyncio.get_running_loop()
+        give_up_at = loop.time() + self._RECONNECT_WINDOW_SEC
+        if deadline is not None:
+            give_up_at = min(give_up_at, deadline)
+        self.logger.warning(
+            f"Lost the output stream of command {pid}, reconnecting: {stream_error!r}"
+        )
+
+        delay = 1.0
+        reconnect_error: Exception | None = None
+        while (sandbox := self._sandbox) is not None:
+            now = loop.time()
+            if now >= give_up_at:
+                break
+            try:
+                handle = await sandbox.commands.connect(
+                    pid,
+                    timeout=deadline - now if deadline is not None else 0,
+                    request_timeout=min(give_up_at - now, 30.0),
+                )
+            except NotFoundException as e:
+                reconnect_error = e
+                break
+            except Exception as e:
+                reconnect_error = e
+                if await self._sandbox_is_gone(sandbox):
+                    break
+                await asyncio.sleep(min(delay, max(give_up_at - loop.time(), 0.0)))
+                delay = min(delay * 2, 30.0)
+                continue
+            self.logger.info(f"Reconnected to command {pid}")
+            return handle
+
+        self.logger.warning(
+            f"Could not reconnect to command {pid}: {reconnect_error!r}"
+        )
+        raise stream_error
+
+    @staticmethod
+    async def _sandbox_is_gone(sandbox: AsyncSandbox) -> bool:
+        """Whether ``sandbox`` reports that it is gone; ``False`` if it cannot tell."""
+        try:
+            return not await sandbox.is_running(request_timeout=10)
+        except NotFoundException:
+            return True
+        except Exception:
+            return False
