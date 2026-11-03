@@ -7,7 +7,7 @@
 ```mermaid
 flowchart LR
   subgraph GPU[GPU 机器：训练容器]
-    S[run_seta.sh / Python 启动器] --> R[Ray / train.py]
+    S[run_seta.sh / Python 启动器] --> R[Ray / train_async.py 或 train.py]
     R --> G[Miles agentic rollout]
     G --> C[agent.py 远端客户端]
     T[session server / TITO] --> I[SGLang]
@@ -121,9 +121,9 @@ Agent 完成、达到轮数或耗尽长度预算后进入验证。verifier 将 t
 
 run_seta.sh 设置默认变量，外部 export 可覆盖；EXP_NAME 表示实验，RUN_ID 表示一次启动。W&B key 写入 600 权限的 NETRC 后从提交环境中移除，避免出现在 Ray argv 和日志。日志以 EXP_NAME + RUN_ID 命名。
 
-Python 启动器检查模型、JSONL、所有 endpoint 的 health、协议与容量，生成 Qwen 结构参数和训练参数。command_utils.execute_train 负责 Ray 启动与 job 提交，实际入口 train.py；没有在 shell 再拼一套训练实现。
+Python 启动器检查模型、JSONL、所有 endpoint 的 health、协议与容量，生成 Qwen 结构参数和训练参数。command_utils.execute_train 负责 Ray 启动与 job 提交；async 选择 train_async.py 和 --fully-async，sync 选择 train.py 和 --colocate，仅采样模式使用 train.py 的 debug-rollout-only。卡数和训练拓扑由 Python 启动器统一推导，shell 仅传入配置；同步/异步开关、全局 train/infer 卡数与多机接入步骤见 [Quick Start 第 4 节](seta_quick_start.md#4-常用调整与多机注意)。
 
-Megatron 和 SGLang 在同一 GPU 节点 colocate，采样与训练阶段交替占用显存。Ray 管理进程、资源和数据引用；不解析任务、不操作终端、不计算测试通过率。
+异步模式中，Megatron 和 SGLang 使用独立 GPU，后台采样持续生成任务组，训练从完成缓冲区取出一批后更新。权重同步采用默认 broadcast，每次训练更新后短暂以 in_place 暂停推理，保留 KV cache 后恢复；训练计算期间采样继续。异步轨迹可能跨越权重版本，沿用配方的 TIS 校正；缓冲、陈旧度和调度细节见 [Fully Async RL](user-guide/fully-async.md)。同步模式中，两者分时复用全部 GPU，完成采样、训练和权重同步后才开始下一批。Ray 管理进程、资源和数据引用；不解析任务、不操作终端、不计算测试通过率。
 
 ### 4.2 任务组 → session → HTTP episode
 

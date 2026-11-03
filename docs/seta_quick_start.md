@@ -21,6 +21,8 @@ bash my_scripts/run_seta.sh
 
 默认全量 4,567 条数据和 W&B online。外部 export 可覆盖脚本默认值；只看配置用 `MODE=plan bash my_scripts/run_seta.sh`。同一专用容器只运行一份训练。
 
+训练默认纯异步，单机 8 卡自动分成 4 卡训练 + 4 卡推理。同步/异步、卡数和多机配置见 [第 4 节](#4-常用调整与多机注意)。默认实验名包含 `async_grpo` 或 `sync_grpo`，两种模式使用独立 checkpoint 目录；显式设置 EXP_NAME 或 SAVE_PATH 可指定恢复路径。`MODE=rollout` 仍使用全部 GPU 做采样验证。
+
 - checkpoint：SAVE_PATH，默认 `/ceph_home/zhangkaiqi2024/saved_models/p2o-agent/$EXP_NAME`；相同实验名重跑加载已有 checkpoint。
 - 训练日志：`seta_miles_runtime/runs/$EXP_NAME/logs/${EXP_NAME}_${RUN_ID}.log`。EXP_NAME 不含时间戳，RUN_ID 区分每次启动。
 - 沙盒轨迹：远端 `nodes[].root/state/trials/`；请求日志在 `state/dashboard/requests.jsonl`。
@@ -193,6 +195,47 @@ export WANDB_API_KEY='<自己的 W&B API key>'
 export WANDB_PROXY='<PROXY_URL>'
 bash my_scripts/run_seta.sh
 ```
+
+直接编辑 `my_scripts/run_seta.sh` 的“GPU 与并行”块，或用同名环境变量覆盖：
+
+| 变量 | 含义 |
+| --- | --- |
+| `TRAINING_MODE=async` | 默认纯异步，训练与推理使用独立 GPU；设为 `sync` 后使用全部 GPU 分时复用 |
+| `NUM_NODES` / `NUM_GPUS_PER_NODE` | 集群节点数、每节点可用 GPU 数；假设各节点卡数一致 |
+| `TRAIN_NUM_GPUS` / `INFER_NUM_GPUS` | 异步训练/推理的**集群总卡数**；同步和仅采样模式忽略它们 |
+| `TENSOR_PARALLEL_SIZE` | 训练 TP，需整除实际每节点训练卡数；global batch 必须能被训练 DP 整除 |
+| `ROLLOUT_GPUS_PER_ENGINE` | 每个推理引擎的卡数，推理总卡数需是其整数倍 |
+
+两个总卡数都为 0 时自动分配：单机各一半，多机将 `floor(NUM_NODES/2)` 个完整节点给训练，其余给推理。只指定一个总卡数时，另一个使用集群剩余卡；同时指定则允许留卡不用，但两者之和不能超过集群容量。申请跨越一台机器时，train+infer 总卡数须为每节点卡数的整数倍，可以留下整台机器；这是为了保持 Ray PACK 后按 IP 排序的节点边界。训练仅占一台机器时可使用部分卡；跨机训练必须使用整数个完整节点。推理引擎可以使用单节点的整数份或整数个节点，跨节点分配时训练卡数还必须对齐推理引擎的节点边界，避免一个本应在单节点内的引擎横跨两机。
+
+```bash
+# 单机：默认异步 4+4；改为同步只需切换 TRAINING_MODE。
+TRAINING_MODE=sync bash my_scripts/run_seta.sh
+
+# 单机异步：6 卡训练 + 2 卡推理，TP=2 / DP=3，global batch 改为 6×16=96。
+TRAINING_MODE=async TRAIN_NUM_GPUS=6 INFER_NUM_GPUS=2 TENSOR_PARALLEL_SIZE=2 \
+  ROLLOUT_BATCH_SIZE=6 bash my_scripts/run_seta.sh
+```
+
+多机需先在各机容器内启动并加入**同一个 Ray 集群**，再只在 head 启动一次本脚本。各节点保持相同容器环境、仓库/数据/模型/checkpoint 绝对路径，并确保节点间 Ray/NCCL 及沙盒回连端口可达。例如两机各 8 卡：
+
+```bash
+# head 容器（替换 HEAD_IP）。
+ray start --head --node-ip-address <HEAD_IP> --port 6379 --num-gpus 8
+
+# worker 容器（替换 HEAD_IP 和 WORKER_IP）。
+ray start --address <HEAD_IP>:6379 --node-ip-address <WORKER_IP> --num-gpus 8
+
+# 回到 head 容器：一个完整节点训练，另一个完整节点推理。
+MILES_SCRIPT_EXTERNAL_RAY=1 NUM_NODES=2 NUM_GPUS_PER_NODE=8 \
+  TRAINING_MODE=async TRAIN_NUM_GPUS=8 INFER_NUM_GPUS=8 bash my_scripts/run_seta.sh
+
+# 三机各 8 卡，两个完整节点训练、一个完整节点推理。
+MILES_SCRIPT_EXTERNAL_RAY=1 NUM_NODES=3 NUM_GPUS_PER_NODE=8 \
+  TRAINING_MODE=async TRAIN_NUM_GPUS=16 INFER_NUM_GPUS=8 bash my_scripts/run_seta.sh
+```
+
+Ray 根据节点 IP/GPU 排序后分配连续资源，上述配置不指定哪台物理机承担训练角色。多机运行未设置 `MILES_SCRIPT_EXTERNAL_RAY=1` 会报错，避免只启动本机 Ray 后无限等待其他节点。可给上述运行命令增加 `MODE=plan` 查看实际 `train_script`、训练节点数和推理卡数，不启动 Ray 或训练。多机的真实 GPU/NCCL 运行尚待资源空闲后验证。
 
 - W&B 默认 online，无需单独 login；`WANDB_PROXY=""` 表示训练端直连，不控制沙盒代理。
 - 修改沙盒代理或并发：改 config.json 后 apply。Dockerfile RUN、任务命令、verifier 在未显式覆盖时使用节点默认代理。

@@ -1,4 +1,4 @@
-"""Qwen3-8B 非思考模式，在完整 SETA-Env 上使用 Terminus-2 + GRPO。
+"""Qwen3-8B 非思考模式，在完整 SETA-Env 上使用 Terminus-2 + GRPO，默认纯异步。
 
 运行前需要已转换的 torch_dist 模型、训练 JSONL 和已运行的远端 Harbor 服务。
 默认仅打印计划；正式训练必须显式选择 --mode train。
@@ -9,15 +9,18 @@ Args:
   --data-dir / --remote-config / --output-dir: 数据、远端服务池配置、输出目录。
   --save-path: checkpoint 保存和恢复的根目录；空值时使用 output-dir/checkpoints。
   --num-nodes / --num-gpus-per-node: 节点与 GPU 数；双机预先加入 Ray。
+  --training-mode: async（默认，独立 GPU 持续采样）或 sync（全部 GPU 分时复用）。
+  --train-num-gpus / --infer-num-gpus: 异步训练/推理的集群总卡数；0 表示自动分配。
   --num-rollout: 非零时覆盖 --num-epoch；小规模验证应使用该参数。
 
 示例：python scripts/run_qwen3_8b_seta.py --mode plan
 """
 
 import json
+import os
 import shlex
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -28,6 +31,18 @@ from miles.utils.external_utils import command_utils as U
 # 直接以 scripts/file.py 执行时，editable 安装只暴露 miles 包；适配代码位于仓库 examples。
 sys.path.insert(0, str(U.repo_base_dir))
 from examples.seta.remote_config import load_endpoints
+
+
+@dataclass(frozen=True)
+class _GpuLayout:
+    actor_num_nodes: int
+    actor_num_gpus_per_node: int
+    infer_num_gpus: int
+    fully_async: bool
+
+    @property
+    def train_script(self) -> str:
+        return "train_async.py" if self.fully_async else "train.py"
 
 
 @dataclass
@@ -41,6 +56,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     save_path: str = ""
     megatron_path: str = "/root/Megatron-LM"
     num_gpus_per_node: int = 8
+    training_mode: Literal["async", "sync"] = "async"
+    train_num_gpus: int = 0
+    infer_num_gpus: int = 0
     tensor_parallel_size: int = 2
     rollout_gpus_per_engine: int = 2
     max_tokens_per_gpu: int = 32768
@@ -67,6 +85,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     session_server_external_host: str = ""
     pin_rollout_manager_to_head: bool = True
     extra_args: str = ""
+    gpu_layout: _GpuLayout = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.gpu_layout = _resolve_gpu_layout(self)
 
     @property
     def hf_path(self) -> str:
@@ -75,6 +97,70 @@ class ScriptArgs(U.ExecuteTrainConfig):
     @property
     def global_batch_size(self) -> int:
         return self.rollout_batch_size * self.n_samples_per_prompt
+
+
+def _resolve_gpu_layout(args: ScriptArgs) -> _GpuLayout:
+    if args.training_mode not in {"async", "sync"}:
+        raise ValueError("training-mode 必须为 async 或 sync")
+    if args.num_nodes <= 0 or args.num_gpus_per_node <= 0:
+        raise ValueError("num-nodes 和 num-gpus-per-node 必须为正整数")
+    if args.train_num_gpus < 0 or args.infer_num_gpus < 0:
+        raise ValueError("train-num-gpus 和 infer-num-gpus 必须 >= 0；0 表示自动分配")
+    capacity = args.num_nodes * args.num_gpus_per_node
+    fully_async = args.training_mode == "async" and args.mode not in {"rollout", "prepare"}
+    if fully_async:
+        train_gpus, infer_gpus = args.train_num_gpus, args.infer_num_gpus
+        if train_gpus == 0:
+            if infer_gpus:
+                train_gpus = capacity - infer_gpus
+            else:
+                # 多机默认按整节点划分，避免把每节点 4 卡误当成 Ray 的实际分配。
+                train_gpus = (
+                    args.num_gpus_per_node // 2
+                    if args.num_nodes == 1
+                    else (args.num_nodes // 2) * args.num_gpus_per_node
+                )
+        infer_gpus = infer_gpus or capacity - train_gpus
+        if train_gpus <= 0 or infer_gpus <= 0 or train_gpus + infer_gpus > capacity:
+            raise ValueError("异步 train/infer 总卡数必须均为正数，且之和不能超过 num-nodes × num-gpus-per-node")
+        requested_gpus = train_gpus + infer_gpus
+        # Ray 先 PACK 再按 IP 排序；末尾半个节点排序到前面会打乱 trainer 的本地 rank。
+        if requested_gpus > args.num_gpus_per_node and requested_gpus % args.num_gpus_per_node:
+            raise ValueError("跨节点申请的 train+infer 总卡数必须按整节点对齐，以保持训练/推理的节点边界")
+        actor_gpus_per_node = min(train_gpus, args.num_gpus_per_node)
+        if train_gpus % actor_gpus_per_node:
+            raise ValueError("跨机训练的 train-num-gpus 必须为 num-gpus-per-node 的整数倍；单机可使用部分 GPU")
+        actor_nodes = train_gpus // actor_gpus_per_node
+    else:
+        # 同步/仅采样模式由全部 GPU 分时复用；异步专用卡数不参与此模式的分配。
+        actor_nodes, actor_gpus_per_node, infer_gpus = args.num_nodes, args.num_gpus_per_node, capacity
+    if args.mode not in {"rollout", "prepare"}:
+        if args.tensor_parallel_size <= 0 or actor_gpus_per_node % args.tensor_parallel_size:
+            raise ValueError("每节点训练 GPU 数必须能被 tensor-parallel-size 整除")
+        dp_size = actor_nodes * actor_gpus_per_node // args.tensor_parallel_size
+        if args.global_batch_size % dp_size:
+            raise ValueError("rollout-batch-size × n-samples-per-prompt 必须能被训练数据并行度整除")
+    engine_gpus = args.rollout_gpus_per_engine
+    if engine_gpus <= 0 or infer_gpus % engine_gpus:
+        raise ValueError("推理总卡数必须能被 rollout-gpus-per-engine 整除")
+    if max(engine_gpus, args.num_gpus_per_node) % min(engine_gpus, args.num_gpus_per_node):
+        raise ValueError("rollout-gpus-per-engine 必须整除每节点 GPU 数，或使用整数个节点")
+    if (
+        fully_async
+        and requested_gpus > args.num_gpus_per_node
+        and train_gpus % min(engine_gpus, args.num_gpus_per_node)
+    ):
+        raise ValueError("训练卡数使推理引擎跨越节点边界；请将 train-num-gpus 对齐推理引擎或整节点")
+    return _GpuLayout(actor_nodes, actor_gpus_per_node, infer_gpus, fully_async)
+
+
+def _execution_args(layout: _GpuLayout) -> str:
+    topology = (
+        f"--actor-num-nodes {layout.actor_num_nodes} " f"--actor-num-gpus-per-node {layout.actor_num_gpus_per_node} "
+    )
+    if layout.fully_async:
+        return topology + f"--fully-async --pause-generation-mode in_place --rollout-num-gpus {layout.infer_num_gpus} "
+    return topology + "--colocate "
 
 
 def _train_args(args: ScriptArgs) -> str:
@@ -97,7 +183,9 @@ def _train_args(args: ScriptArgs) -> str:
     )
     # 仅采样验证不筛选同分组，避免小样本调试因缺少奖励方差不断补采。
     if args.mode != "rollout":
-        rollout += "--dynamic-sampling-filter-path miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter "
+        rollout += (
+            "--dynamic-sampling-filter-path miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter "
+        )
     if args.session_server_external_host:
         rollout += f"--session-server-external-host {shlex.quote(args.session_server_external_host)} "
     if args.pin_rollout_manager_to_head:
@@ -115,12 +203,22 @@ def _train_args(args: ScriptArgs) -> str:
     misc = (
         "--seed 1 --bf16 --attention-dropout 0 --hidden-dropout 0 "
         f"--attention-backend {args.attention_backend} "
-        "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --colocate "
-        f"--actor-num-nodes {args.num_nodes} --actor-num-gpus-per-node {args.num_gpus_per_node} "
+        "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 "
         f"--num-gpus-per-node {args.num_gpus_per_node} --dump-details {shlex.quote(args.output_dir + '/dump_details')} "
     )
     debug = "--debug-rollout-only " if args.mode == "rollout" else ""
-    return checkpoint + rollout + perf + algorithm + optimizer + sglang + misc + debug + args.extra_args
+    return (
+        checkpoint
+        + rollout
+        + perf
+        + algorithm
+        + optimizer
+        + sglang
+        + misc
+        + _execution_args(args.gpu_layout)
+        + debug
+        + args.extra_args
+    ).strip()
 
 
 def _worker_env(args: ScriptArgs) -> dict[str, str]:
@@ -159,12 +257,19 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    if (
+        args.num_nodes > 1
+        and args.cluster_backend.value == "ray"
+        and os.environ.get("MILES_SCRIPT_EXTERNAL_RAY") != "1"
+    ):
+        raise ValueError("多机运行需先将所有节点加入 Ray，再设置 MILES_SCRIPT_EXTERNAL_RAY=1；只在 head 启动本脚本")
     wandb = U.get_default_wandb_args(__file__, run_id=args.run_id)
     args.create_backend().execute_train(
         train_args=_train_args(args) + " " + wandb,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type="qwen3-8B",
+        train_script=args.gpu_layout.train_script,
         megatron_path=args.megatron_path,
         extra_env_vars=_worker_env(args),
         # Ctrl+C/TERM 必须停止 Ray 作业，而不只是断开日志跟随客户端。
@@ -207,7 +312,18 @@ def _check_remote_services(config_path: str) -> None:
 @U.dataclass_cli
 def main(args: ScriptArgs):
     if args.mode == "plan":
-        print(json.dumps({"train_args": _train_args(args), "worker_env": _worker_env(args)}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "train_script": args.gpu_layout.train_script,
+                    "gpu_layout": asdict(args.gpu_layout),
+                    "train_args": _train_args(args),
+                    "worker_env": _worker_env(args),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif args.mode == "prepare":
         prepare(args)
     else:

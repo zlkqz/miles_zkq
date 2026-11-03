@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SETA + Qwen3-8B + Terminus-2；GPU 训练通过 HTTP 使用远端 Harbor 沙盒。
+# SETA + Qwen3-8B + Terminus-2，默认纯异步；通过 HTTP 使用远端 Harbor 沙盒。
 # 默认正式训练并启用 W&B；只查看配置：MODE=plan bash my_scripts/run_seta.sh
 # 外部 export 覆盖下列默认值；更多 Python 启动参数也可作为脚本参数追加。
 set -euo pipefail
@@ -26,6 +26,16 @@ export REMOTE_CONFIG="${REMOTE_CONFIG:-$RUNTIME_DIR/remote/endpoints.json}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NUM_NODES="${NUM_NODES:-1}"
 export NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-8}"
+# async：训练/推理独占不同卡；sync：全部 GPU 分时复用，忽略下面两个异步卡数。
+export TRAINING_MODE="${TRAINING_MODE:-async}"
+# 集群总卡数，不是每节点卡数；0 由 Python 启动器自动分配。
+# 全为 0：单机默认 4+4，多机按整节点划分，训练占 floor(NUM_NODES/2) 台。
+# 只指定一个：另一个使用剩余卡；也可显式指定两个数，允许留卡不用。
+# 例：两台各 8 卡，TRAIN_NUM_GPUS=8 INFER_NUM_GPUS=8；三台可设 16+8。
+export TRAIN_NUM_GPUS="${TRAIN_NUM_GPUS:-0}"
+export INFER_NUM_GPUS="${INFER_NUM_GPUS:-0}"
+# 多机：所有 worker 先加入 head 的 Ray；仅在 head 启动本脚本并设置此值为 1。
+export MILES_SCRIPT_EXTERNAL_RAY="${MILES_SCRIPT_EXTERNAL_RAY:-0}"
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
 export ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-2}"
 # rollout 协调器固定在 head，endpoint/token 只需放在 head 的训练容器。
@@ -88,7 +98,7 @@ export SESSION_SERVER_EXTERNAL_HOST="${SESSION_SERVER_EXTERNAL_HOST:-$GPU_HOST}"
 
 # ── 实验名、checkpoint 与日志输出 ───────────────────────────────────────────
 # 实验名和 checkpoint 路径不含时间戳，相同配置重跑时自动读取同一目录。
-export EXP_NAME="${EXP_NAME:-qwen3_8b_seta_remote_grpo_${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}_len${MAX_SEQ_LEN}+${MAX_RESPONSE_LEN}_turn${AGENT_MAX_ITERATIONS}_lr${LR}}"
+export EXP_NAME="${EXP_NAME:-qwen3_8b_seta_remote_${TRAINING_MODE}_grpo_${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}_len${MAX_SEQ_LEN}+${MAX_RESPONSE_LEN}_turn${AGENT_MAX_ITERATIONS}_lr${LR}}"
 export SAVE_PATH="${SAVE_PATH:-/ceph_home/zhangkaiqi2024/saved_models/p2o-agent/$EXP_NAME}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$RUNTIME_DIR/runs/$EXP_NAME}"
 
@@ -251,6 +261,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf '模式：%s；节点：%s；每节点 GPU：%s\n' "$MODE" "$NUM_NODES" "$NUM_GPUS_PER_NODE" >&"$log_fd"
+printf '训练调度：%s；异步总卡数 train=%s / infer=%s（0 表示自动）\n' "$TRAINING_MODE" "$TRAIN_NUM_GPUS" "$INFER_NUM_GPUS" >&"$log_fd"
 printf '实验名：%s；checkpoint：%s\n' "$EXP_NAME" "$SAVE_PATH" >&"$log_fd"
 printf 'W&B：%s / %s / %s\n' "$WANDB_MODE" "$WANDB_PROJECT" "$WANDB_RUN_NAME" >&"$log_fd"
 printf '输出目录：%s；终端日志：%s\n' "$OUTPUT_DIR" "$LOG_FILE" >&"$log_fd"
@@ -266,6 +277,7 @@ _start_seta() {
     --data-dir "$DATA_DIR" \
     --output-dir "$OUTPUT_DIR" --save-path "$SAVE_PATH" \
     --num-nodes "$NUM_NODES" --num-gpus-per-node "$NUM_GPUS_PER_NODE" \
+    --training-mode "$TRAINING_MODE" --train-num-gpus "$TRAIN_NUM_GPUS" --infer-num-gpus "$INFER_NUM_GPUS" \
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
     --rollout-gpus-per-engine "$ROLLOUT_GPUS_PER_ENGINE" \
     --num-epoch "$NUM_EPOCH" --num-rollout "$NUM_ROLLOUT" \
