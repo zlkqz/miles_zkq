@@ -66,7 +66,7 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     else:
         standard_path = "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
     rollout_path = args.rollout_function_path or standard_path
-    if args.fully_async:
+    if args.fully_async and args.rollout_function_path is None:
         rollout_path = FULLY_ASYNC_ROLLOUT_PATH
     # Resolved after the override: shared-engine eval must reach the producer it pauses.
     eval_path = args.eval_function_path or rollout_path
@@ -99,9 +99,23 @@ def _resolve_rollout_functions(args) -> None:
         ), "--fully-async needs the class-based rollout API; unset MILES_USE_LEGACY_ROLLOUT_V1"
         # Runs after validate_multi_lora_args, which selects a rollout function of its own.
         assert not args.multi_lora, "--fully-async and multi-LoRA select different rollout functions"
-        assert (
-            args.rollout_function_path is None
-        ), "--fully-async and --rollout-function-path both select a rollout function; pass only one"
+        if args.rollout_function_path is not None:
+            # A fully-async subclass retains the native scheduler/buffer contract
+            # and must keep the mode's cache, weight-update and driver checks.
+            # Defer this import until validation to avoid the args/rollout cycle.
+            from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
+
+            try:
+                rollout_cls = load_function(args.rollout_function_path)
+            except (ModuleNotFoundError, ValueError) as error:
+                raise AssertionError(
+                    "--fully-async and --rollout-function-path both select a rollout function; "
+                    "pass only one unless the explicit path is a loadable FullyAsyncRolloutFn subclass"
+                ) from error
+            assert isinstance(rollout_cls, type) and issubclass(rollout_cls, FullyAsyncRolloutFn), (
+                "--fully-async and --rollout-function-path both select a rollout function; "
+                "pass only one unless the explicit path is a FullyAsyncRolloutFn subclass"
+            )
         if args.colocate:
             assert args.train_backend != "fsdp", (
                 "--fully-async --colocate needs the megatron IPC weight updater; the FSDP updater still "
@@ -2632,6 +2646,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
             )
             parser.add_argument(
+                "--custom-megatron-actor-scoring-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional actor scoring hook(args, rollout_data, *, score). Runs with the frozen old actor; "
+                    "score(data, prefix) uses native forward-only scoring. The hook writes log_probs and may "
+                    "replace scoring/training contexts while preserving episode identities and loss masks."
+                ),
+            )
+            parser.add_argument(
                 "--custom-megatron-before-train-step-hook-path",
                 type=str,
                 default=None,
@@ -4255,6 +4279,10 @@ def validate_skip_actor_forward_only(args) -> None:
             ("--use-rollout-entropy", args.use_rollout_entropy),
             ("--true-on-policy-mode", args.true_on_policy_mode),
             ("--log-correct-samples", args.log_correct_samples),
+            (
+                "--custom-megatron-actor-scoring-path",
+                getattr(args, "custom_megatron_actor_scoring_path", None) is not None,
+            ),
             (
                 "--custom-megatron-before-log-prob-hook-path",
                 args.custom_megatron_before_log_prob_hook_path is not None,

@@ -339,6 +339,7 @@ def _assert_witness_rows(*, total_rows: int, shards: list[dict[str, Any]]) -> No
 class RolloutDataPack(StrictBaseModel):
     sample_indices: list[int] | None = None
     data_ref: object_store.StoreObjectRef | list[object_store.StoreObjectRef] | None = None
+    phase_boundary: bool = False
 
     @property
     def data_refs(self) -> list[object_store.StoreObjectRef]:

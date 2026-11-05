@@ -474,6 +474,8 @@ def run_forward_backward_pass(
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "importance_log_probs",
+                "pg_loss_weights",
                 "rollout_topk_token_ids",
                 "rollout_topk_lengths",
                 "rollout_topk_log_probs",

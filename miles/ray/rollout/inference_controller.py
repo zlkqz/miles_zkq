@@ -71,6 +71,11 @@ class InferenceController:
         if not self.args.starts_inference_engines:
             return
 
+        await self._start_serving()
+
+    @lock_exempt
+    async def _start_serving(self) -> None:
+
         await self._engine_provider.init()
         router_addrs = await resolve_router_addrs(self.args, router_providers=self._router_providers)
         self.servers = await create_rollout_servers(
@@ -88,6 +93,17 @@ class InferenceController:
         dashboard_hooks.register_router(self.args)
 
         await self.wait_expected_num_cells()
+
+    @lock_exempt
+    async def resume_after_phase(self) -> None:
+        """Reattach original providers after a drained, externally managed phase.
+
+        The caller must have disposed serving and stopped/restarted the original
+        engine cells. It restores weights before allowing rollout submissions.
+        """
+        if self.servers or self._watcher_disposers or self._ticker is not None:
+            raise RuntimeError("Inference serving must be disposed before phase restoration")
+        await self._start_serving()
 
     # -------------------------- take over -----------------------------
 
@@ -147,6 +163,7 @@ class InferenceController:
 
         for srv in self.servers.values():
             await srv.dispose()
+        self.servers = {}
 
     # -------------------------- offload/onload -----------------------------
 

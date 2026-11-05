@@ -80,6 +80,7 @@ class RayWorkerManager:
         self.comm_backend = comm_backend
         self.pgs = pgs
         self._pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
+        self._temporary_pool_ids: set[str] = set()
         assert len(self._pools) == len(specs)
         self._membership_lock = asyncio.Lock()
 
@@ -104,6 +105,57 @@ class RayWorkerManager:
     async def shutdown(self) -> None:
         async with self._membership_lock:
             await asyncio.gather(*[cell.stop() for cell in self._all_cells()])
+
+    async def register_pools(self, specs: list[BaseWorkerSpec]) -> list[str]:
+        """Register dormant pools on this run's existing placement groups.
+
+        Explicit start/stop separates resource planning from phase transitions.
+        Names cannot replace existing pools, including currently stopped ones.
+        """
+        async with self._membership_lock:
+            names = [spec.name for spec in specs]
+            if len(set(names)) != len(names) or set(names) & self._pools.keys():
+                raise ValueError(f"Pool names must be new and unique: {names}")
+            for spec in specs:
+                scheduling = spec.scheduling
+                if scheduling.pg_name is not None:
+                    pg = self.pgs[scheduling.pg_name]
+                    end = scheduling.pg_slot_offset + (
+                        scheduling.num_cells * scheduling.num_workers_per_cell * scheduling.num_gpu_slots_per_worker
+                    )
+                    if scheduling.pg_slot_offset < 0 or end > len(pg.pg_reordered_gpu_ids):
+                        raise ValueError(f"Pool {spec.name} exceeds its placement group's GPU slots")
+            pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
+            self._pools.update(pools)
+            self._temporary_pool_ids.update(pools)
+            return [cell.cell_id for pool in pools.values() for cell in pool.cells]
+
+    async def remove_pools(self, pool_ids: list[str]) -> None:
+        """Stop and unregister explicitly named temporary pools."""
+        async with self._membership_lock:
+            if set(pool_ids) - self._temporary_pool_ids:
+                raise ValueError("Only explicitly registered temporary pools can be removed")
+            pools = [self._pools[name] for name in pool_ids]
+            await asyncio.gather(*[cell.stop() for pool in pools for cell in pool.cells])
+            for name in pool_ids:
+                del self._pools[name]
+                self._temporary_pool_ids.remove(name)
+
+    def gpu_slots(self, pg_name: str) -> list[dict]:
+        """Report node-qualified physical devices in the manager's slot order."""
+        pg = self.pgs[pg_name]
+        table = ray.util.placement_group_table(pg.pg)
+        nodes = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
+        return [
+            {
+                "slot": slot,
+                "bundle_index": bundle,
+                "node_id": table["bundles_to_node_id"][bundle],
+                "node_ip": nodes[table["bundles_to_node_id"][bundle]],
+                "physical_gpu_id": int(pg.pg_reordered_gpu_ids[slot]),
+            }
+            for slot, bundle in enumerate(pg.pg_reordered_bundle_indices)
+        ]
 
     def observe_fault_target(self, cell_id: str, *, rank: int) -> ObservedFaultHookTarget:
         cell = self._find_cell(cell_id)

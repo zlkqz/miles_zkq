@@ -153,13 +153,16 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return self.args.rollout_batch_size
 
     def _submit_one_group(self) -> asyncio.Task:
-        samples = [self._retry_buffer.popleft()] if self._retry_buffer else self.data_source.get_samples(1)
+        samples = self._next_prompt_groups()
         stamp_kv_cache_namespace(samples, namespace=self._curr_kv_cache_namespace)
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
         task = asyncio.create_task(self._generate_group(prompt_group))
         self._running_tasks.append(_RunningTask(prompt_group=prompt_group, task=task))
         return task
+
+    def _next_prompt_groups(self) -> list[list[Sample]]:
+        return [self._retry_buffer.popleft()] if self._retry_buffer else self.data_source.get_samples(1)
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
         result = await generate_and_rm_group(
@@ -211,12 +214,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         assert not self._worker.done(), "the fully-async rollout worker has ended"
         self._worker_error_cancel_targets.add(asyncio.current_task())
-        entries = await self._output.get(
-            current_version=input.weight_version,
-            num_groups=args.rollout_batch_size,
-            trainer_model_id=input.trainer_model_id,
-        )
-        self._worker_error_cancel_targets.discard(asyncio.current_task())
+        try:
+            entries = await self._output.get(
+                current_version=input.weight_version,
+                num_groups=args.rollout_batch_size,
+                trainer_model_id=input.trainer_model_id,
+            )
+        finally:
+            self._worker_error_cancel_targets.discard(asyncio.current_task())
 
         data: list[Group] = []
         do_print = True

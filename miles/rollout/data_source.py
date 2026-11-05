@@ -97,6 +97,14 @@ class RolloutDataSource(DataSource):
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 
+        return self.materialize_samples(prompt_samples)
+
+    def materialize_samples(self, prompt_samples: list[Sample]) -> list[list[Sample]]:
+        """Allocate native episode identities without advancing the dataset cursor.
+
+        A replay sampler can draw catalog rows through this API while natural
+        get_samples() retains sole ownership of the epoch permutation/offset.
+        """
         samples = []
         for prompt_sample in prompt_samples:
             group = []

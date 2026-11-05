@@ -21,6 +21,10 @@ class RolloutFnConstructorInput:
     data_source: DataSource
 
 
+class RolloutPhaseBoundary(Exception):
+    """A drained producer needs a driver phase before it can fill another batch."""
+
+
 @dataclass(frozen=True)
 class RolloutFnBaseInput:
     rollout_id: int

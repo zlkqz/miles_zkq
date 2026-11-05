@@ -51,6 +51,7 @@ from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
+from miles.utils.function_registry import load_function
 from miles.utils.logging_utils import rebind_env_reporting
 from miles.utils.lora.utils import build_lora_config, is_multi_lora_enabled
 from miles.utils.memory_utils import clear_memory, print_memory
@@ -264,7 +265,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.rollout_data_postprocess = None
         if (x := self.args.rollout_data_postprocess_path) is not None:
-            from miles.utils.function_registry import load_function
 
             self.rollout_data_postprocess = load_function(x)
 
@@ -310,17 +310,23 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         if publish_snapshots:
-            is_lora = is_lora_enabled(args)
-            iterator = get_hf_weight_iterator(
-                args,
-                self.model,
-                required_placement=WeightUpdatePlacement(gather_pp=True),
-                model_name=model_name,
-                quantization_config=None if is_lora else quantization_config,
-            )
-            self.snapshot_publisher = SnapshotPublisher(
-                iterator, build_lora_config(args, target_modules=args.lora_adapter_targets) if is_lora else None
-            )
+            self._ensure_snapshot_publisher()
+
+    def _ensure_snapshot_publisher(self) -> None:
+        if self.snapshot_publisher is not None:
+            return
+        args = self.args
+        is_lora = is_lora_enabled(args)
+        iterator = get_hf_weight_iterator(
+            args,
+            self.model,
+            required_placement=WeightUpdatePlacement(gather_pp=True),
+            model_name=converter_model_name(args, self.hf_config),
+            quantization_config=None if is_lora else getattr(self.hf_config, "quantization_config", None),
+        )
+        self.snapshot_publisher = SnapshotPublisher(
+            iterator, build_lora_config(args, target_modules=args.lora_adapter_targets) if is_lora else None
+        )
 
     def _clear_quantized_weight_workspaces(self) -> None:
         if not (
@@ -520,6 +526,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups()
+        if self.role == "actor" and self.args.disable_param_buffers_cpu_backup and self._enable_weight_backup:
+            # Memory-saver recreates these buffers without their values. Restore
+            # before exposing a resident actor to export/weight publication;
+            # waiting for _train_actor's switch would publish discarded storage.
+            self._switch_model(self._active_model_tag)
         self._asleep = False
         print_memory("after wake_up model")
 
@@ -674,6 +685,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def _use_rollout_replay(self, m) -> bool:
         return getattr(self.args, f"use_rollout_{m.name}_replay", False)
 
+    def _score_actor_batch(self, data: RolloutBatch, prefix: str, *, rollout_id: int):
+        """A scoring plugin uses the same actor and native pipeline/CP schedule."""
+        iterator, microbatches = get_data_iterator(self.args, self.model, data)
+        return self._compute_log_prob(iterator, microbatches, rollout_id=rollout_id, store_prefix=prefix)
+
     @with_logs
     def _train_actor(
         self,
@@ -735,7 +751,17 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not skip_actor_forward_only and (
+                if scoring_path := getattr(self.args, "custom_megatron_actor_scoring_path", None):
+                    self._set_replay_stage("fallthrough")
+                    load_function(scoring_path)(
+                        self.args,
+                        rollout_data,
+                        score=partial(self._score_actor_batch, rollout_id=rollout_id),
+                    )
+                    data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+                    if len(num_microbatches) != num_optimizer_steps:
+                        raise ValueError("actor scoring hook changed the number of optimizer steps")
+                elif not skip_actor_forward_only and (
                     not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
                 ):
                     for m in all_replay_managers:
@@ -875,8 +901,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
             from megatron.training.checkpointing import get_checkpoint_name
 
-            from miles.utils.function_registry import load_function
-
             checkpoint_dir = get_checkpoint_name(self.args.save, rollout_id, return_base_dir=True)
             hf_checkpoint_dir = (
                 self.args.save_hf.format(rollout_id=rollout_id)
@@ -897,7 +921,9 @@ class MegatronTrainRayActor(TrainRayActor):
         that failed to export can be skipped loudly.
         """
         self._heartbeat.bump()
-        assert self.snapshot_publisher is not None, "HF export requires a snapshot publisher"
+        # On-demand exports (for example, a drained inference phase) need not
+        # enable periodic --save-hf or snapshot evaluation at launch.
+        self._ensure_snapshot_publisher()
         save_hf_model(
             self.args, rollout_id, self.model, publisher=self.snapshot_publisher, path=path, raise_on_error=True
         )

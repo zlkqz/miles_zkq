@@ -1,10 +1,15 @@
 """SETA 的有限长度 episode：预算耗尽结束 agent，然后仍验证已有任务状态。"""
 
+from examples.seta.p2o.templates import Template, augment_instruction
 from harbor.agents.terminus_2.terminus_2 import Terminus2
 from harbor.llms.base import ContextLengthExceededError, MaxSeqLenExceededError, SingleTurnMaxSeqLenExceededError
 
 
 class SetaTerminus2(Terminus2):
+    def __init__(self, *args, p2o_template=None, **kwargs):
+        self._p2o_template = Template.from_dict(p2o_template) if p2o_template is not None else None
+        super().__init__(*args, **kwargs)
+
     async def _run_agent_loop(self, *args, **kwargs):
         try:
             await super()._run_agent_loop(*args, **kwargs)
@@ -16,6 +21,8 @@ class SetaTerminus2(Terminus2):
 
     async def run(self, instruction, environment, context):
         self._seta_stop_reason = None
+        if self._p2o_template is not None:
+            instruction = augment_instruction(instruction, self._p2o_template)
         await super().run(instruction, environment, context)
         if self._seta_stop_reason:
             context.metadata["seta_stop_reason"] = self._seta_stop_reason

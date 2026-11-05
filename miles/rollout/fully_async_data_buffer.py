@@ -222,6 +222,7 @@ class DefaultDataBuffer(DataBuffer):
                 self._drop_stale(current_version)
                 if len(self._buffer) >= num_groups:
                     break
+                self._check_wait_condition()
                 if (remaining := deadline - time.monotonic()) <= 0:
                     logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
                     deadline = time.monotonic() + NO_PROGRESS_WARN_SECS
@@ -231,8 +232,7 @@ class DefaultDataBuffer(DataBuffer):
                 except asyncio.TimeoutError:
                     pass
 
-            entries = self._buffer[:num_groups]
-            del self._buffer[:num_groups]
+            entries = self._select_available(num_groups)
             self._cond.notify_all()  # wake producers blocked on a full buffer
             for entry in entries:
                 version_stats = group_weight_version_stats(entry.group)
@@ -240,6 +240,16 @@ class DefaultDataBuffer(DataBuffer):
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
             return entries
+
+    def _check_wait_condition(self) -> None:
+        """A phase-aware buffer may interrupt an otherwise unfillable wait."""
+        return None
+
+    def _select_available(self, num_groups: int) -> list[DataBufferInput]:
+        """Remove complete batches under _cond, after native staleness filtering."""
+        entries = self._buffer[:num_groups]
+        del self._buffer[:num_groups]
+        return entries
 
     def _drop_stale(self, current_version: int | None) -> None:
         limit = self._args.max_weight_staleness

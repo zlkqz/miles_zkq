@@ -11,6 +11,12 @@ trap '' HUP
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_DIR="${REPO_DIR:-$(dirname -- "$SCRIPT_DIR")}"
 export MODE="${MODE:-train}"
+# 兼容原入口：默认仍开启过滤；新实验使用 run_seta_grpo.sh / run_seta_dapo.sh。
+export SETA_ALGORITHM="${SETA_ALGORITHM:-dapo}"
+case "$SETA_ALGORITHM" in
+  grpo|dapo|p2o) ;;
+  *) echo "SETA_ALGORITHM 必须为 grpo、dapo 或 p2o" >&2; exit 2 ;;
+esac
 export PYTHON_BIN="${PYTHON_BIN:-python}"
 export PYTHONUNBUFFERED=1
 cd "$REPO_DIR"
@@ -98,7 +104,7 @@ export SESSION_SERVER_EXTERNAL_HOST="${SESSION_SERVER_EXTERNAL_HOST:-$GPU_HOST}"
 
 # ── 实验名、checkpoint 与日志输出 ───────────────────────────────────────────
 # 实验名和 checkpoint 路径不含时间戳，相同配置重跑时自动读取同一目录。
-export EXP_NAME="${EXP_NAME:-qwen3_8b_seta_remote_${TRAINING_MODE}_grpo_${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}_len${MAX_SEQ_LEN}+${MAX_RESPONSE_LEN}_turn${AGENT_MAX_ITERATIONS}_lr${LR}}"
+export EXP_NAME="${EXP_NAME:-qwen3_8b_seta_remote_${TRAINING_MODE}_${SETA_ALGORITHM}_${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}_len${MAX_SEQ_LEN}+${MAX_RESPONSE_LEN}_turn${AGENT_MAX_ITERATIONS}_lr${LR}}"
 export SAVE_PATH="${SAVE_PATH:-/ceph_home/zhangkaiqi2024/saved_models/p2o-agent/$EXP_NAME}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$RUNTIME_DIR/runs/$EXP_NAME}"
 
@@ -294,6 +300,7 @@ _start_seta() {
     --full-pass-bonus "$FULL_PASS_BONUS" --save-interval "$SAVE_INTERVAL" --lr "$LR" \
     --extra-env-vars "$WORKER_ENV_JSON" --extra-args "$MILES_EXTRA_ARGS" \
     "$@" \
+    --algorithm "$SETA_ALGORITHM" \
     --run-id "$RUN_ID" --ray-submission-id "$RUN_ID" --remote-config "$REMOTE_CONFIG"
 }
 _start_seta "$@" >&"$log_fd" 2>&1 &

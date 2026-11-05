@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import time
 from copy import deepcopy
@@ -22,6 +23,7 @@ from miles.rollout.session.request_args import filter_turn_args, parse_chat_requ
 from miles.rollout.session.samples.codec import COMPUTED_FIELDS_V2, ROLLOUT_SAMPLING_MASK_FIELDS, encode_samples
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY, build_session_rollout_metrics
+from miles.rollout.session.v2.postprocess_context import SamplePostprocessContext
 from miles.rollout.session.v2.session_state import (
     SessionRegistryV2,
     SessionStateV2,
@@ -46,6 +48,7 @@ class SessionCoreV2(SessionCore):
         # Import-path only in production: function_registry is process-local.
         self.sample_picker = load_function(config.session_sample_picker_path, sync_required=True)
         self.sample_postprocessor = load_function(config.session_sample_postprocessor_path, sync_required=True)
+        self._postprocessor_uses_context = "sample_context" in inspect.signature(self.sample_postprocessor).parameters
 
     def _session_metadata(self, session_id: str, session) -> dict:
         """Mirrors ``core.SessionCore._session_metadata``: token ids come from
@@ -146,7 +149,12 @@ class SessionCoreV2(SessionCore):
                 raise ValueError(
                     "pick hook must return a subset of its input samples without duplicates (pure selection)"
                 )
-            samples = self.sample_postprocessor(picked, metadata)
+            hook_kwargs = {}
+            if self._postprocessor_uses_context:
+                hook_kwargs["sample_context"] = SamplePostprocessContext.from_snapshot(
+                    session, self.registry.tito_tokenizer
+                )
+            samples = self.sample_postprocessor(picked, metadata, **hook_kwargs)
         except Exception as exc:
             body = (
                 f"session sample hook failed (picker={self.config.session_sample_picker_path}, "

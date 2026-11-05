@@ -23,6 +23,7 @@ from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
     RolloutFnTrainInput,
+    RolloutPhaseBoundary,
     call_rollout_fn,
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
@@ -172,7 +173,10 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
         event_analyzer.run_sample_ownership_analysis(args=self.args)
         replay = self._output_snapshotter.get(trainer_model_id=trainer_model_id, rollout_id=rollout_id)
         if replay is None:
-            generated = await self._generate_rollout_data(rollout_id=rollout_id, trainer_model_id=trainer_model_id)
+            try:
+                generated = await self._generate_rollout_data(rollout_id=rollout_id, trainer_model_id=trainer_model_id)
+            except RolloutPhaseBoundary:
+                return RolloutDataPack(phase_boundary=True)
             if generated is None:
                 return RolloutDataPack(empty_batch_timeout=True)
             data, metadata = generated
@@ -353,13 +357,19 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
     # async but never awaits: the RPC layer runs sync methods on a thread, and an await-free coroutine is atomic against the rollout coroutines on this loop
-    async def save(self, rollout_id: int, completed_rollout_ids: dict[str, int] | None = None) -> None:
+    async def save(
+        self, rollout_id: int, completed_rollout_ids: dict[str, int] | None = None, directory: str | None = None
+    ) -> None:
         assert self.args.save is not None, "the orchestration only saves when --save is set"
 
         self._output_snapshotter.discard_completed(
             completed_rollout_ids={None: rollout_id} if completed_rollout_ids is None else completed_rollout_ids
         )
-        target = compute_rollout_checkpoint_dir(self.args.save, rollout_id=rollout_id)
+        target = (
+            Path(directory)
+            if directory is not None
+            else compute_rollout_checkpoint_dir(self.args.save, rollout_id=rollout_id)
+        )
         with atomic_save_folder(target) as dir_temp:
             self.data_source.save(dir_temp / _DATA_SOURCE_DIRNAME)
             if not self.use_legacy_rollout_v1:
@@ -395,6 +405,10 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
                 eval_fn.load(directory / _EVAL_GENERATE_ROLLOUT_DIRNAME)
 
     # -------------------------- misc APIs -----------------------------
+
+    async def rollout_phase(self, operation: str, payload: dict | None = None) -> dict:
+        """Delegate an explicit phase protocol to the selected rollout plugin."""
+        return await self.generate_rollout.phase(operation, payload or {})
 
     def get_num_rollout_per_epoch(self) -> int:
         assert self.args.rollout_global_dataset

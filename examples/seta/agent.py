@@ -6,20 +6,30 @@ import os
 import uuid
 
 import httpx
-
-from miles.rollout.agentic.rollout_limits import rollout_semaphore
+from examples.seta.p2o.contexts import attach_contexts
+from examples.seta.p2o.templates import Template
 from examples.seta.remote_config import EPISODE_ENV, load_endpoints
 from examples.seta.remote_pool import endpoint_slot
+
+from miles.rollout.agentic.rollout_limits import rollout_semaphore
+from miles.rollout.session.v2.postprocessor_hub.default_postprocess import default_postprocess
 
 _official = importlib.import_module("examples.swe-agent-harbor-docker.swe_agent_function")
 logger = logging.getLogger(__name__)
 
 
 async def run(base_url, prompt, request_kwargs, metadata, **kwargs):
+    if metadata.get("p2o_template") is not None:
+        Template.from_dict(metadata["p2o_template"])
     async with rollout_semaphore("seta-harbor", int(os.environ["SETA_MAX_CONCURRENT_TRIALS"])):
         async with endpoint_slot(load_endpoints(os.environ["SETA_REMOTE_CONFIG"])) as endpoint:
             request_id = uuid.uuid4().hex
-            meta = {**metadata, "run_id": os.environ["SETA_RUN_ID"], "request_id": request_id, "seta_settings": {key: os.environ[key] for key in EPISODE_ENV if key in os.environ}}
+            meta = {
+                **metadata,
+                "run_id": os.environ["SETA_RUN_ID"],
+                "request_id": request_id,
+                "seta_settings": {key: os.environ[key] for key in EPISODE_ENV if key in os.environ},
+            }
             result = await _official.run(
                 base_url,
                 prompt,
@@ -31,6 +41,10 @@ async def run(base_url, prompt, request_kwargs, metadata, **kwargs):
             )
             if result is None:
                 result = {"seta_valid_reward": False, "seta_error": "官方 agent-server 请求失败或已取消"}
+            if metadata.get("p2o_template") is not None:
+                # Keep the requested identity even on timeout; the session hook
+                # verifies actual messages instead of trusting a remote echo.
+                result["p2o_template"] = metadata["p2o_template"]
             logger.info("远端 episode 完成：%s / %s / reward=%s", endpoint.url, request_id, result.get("reward"))
             return {**result, "remote_endpoint": endpoint.url, "remote_request_id": request_id}
 
@@ -39,15 +53,31 @@ async def abort(args):
     """Miles 原生 abort hook：只 flush 当前训练的任务，不影响同服务的其他运行。"""
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
         for endpoint in load_endpoints(os.environ["SETA_REMOTE_CONFIG"]):
-            response = await client.post(f"{endpoint.url}/flush", json={"run_id": os.environ["SETA_RUN_ID"]}, headers=endpoint.headers())
+            response = await client.post(
+                f"{endpoint.url}/flush", json={"run_id": os.environ["SETA_RUN_ID"]}, headers=endpoint.headers()
+            )
             response.raise_for_status()
 
 
 async def reward_func(args, samples, **kwargs):
     if isinstance(samples, list):
         return [await reward_func(args, sample, **kwargs) for sample in samples]
-    if not samples.metadata.get("seta_valid_reward", False):
-        samples.status = samples.Status.ABORTED
-        logger.error("丢弃无效验证轨迹：%s", samples.metadata.get("seta_error"))
+    return _sample_reward(samples)
+
+
+def _sample_reward(sample):
+    if not sample.metadata.get("seta_valid_reward", False):
+        sample.status = sample.Status.ABORTED
+        logger.error("丢弃无效验证轨迹：%s", sample.metadata.get("seta_error"))
         return 0.0
-    return float(samples.metadata["reward"])
+    return float(sample.metadata["reward"])
+
+
+def postprocess_session_samples(leaf_samples, session_metadata, *, sample_context=None):
+    """Preserve v2 token ownership and enforce SETA validity before rewards are cached."""
+    samples = default_postprocess(leaf_samples, session_metadata)
+    # v2 pre-fills rewards, so the downstream RM hook is skipped for these samples.
+    for sample in samples:
+        sample.reward = _sample_reward(sample)
+    attach_contexts(samples, session_metadata, sample_context)
+    return samples

@@ -1,6 +1,7 @@
 """Qwen3-8B 非思考模式，在完整 SETA-Env 上使用 Terminus-2 + GRPO，默认纯异步。
 
 运行前需要已转换的 torch_dist 模型、训练 JSONL 和已运行的远端 Harbor 服务。
+使用 session server v2，支持纯异步权重更新时的版本隔离 KV cache。
 默认仅打印计划；正式训练必须显式选择 --mode train。
 
 Args:
@@ -11,6 +12,9 @@ Args:
   --num-nodes / --num-gpus-per-node: 节点与 GPU 数；双机预先加入 Ray。
   --training-mode: async（默认，独立 GPU 持续采样）或 sync（全部 GPU 分时复用）。
   --train-num-gpus / --infer-num-gpus: 异步训练/推理的集群总卡数；0 表示自动分配。
+  --algorithm: grpo 关闭同分过滤；dapo 开启（默认）；p2o 在 GRPO 上启用难任务/CRM/GEPA。
+  --gepa-trigger-unique-hard-tasks / --gepa-budget: GEPA 难任务触发门槛与探索预算。
+  --gepa-reflection-num-gpus / --gepa-reflection-tp: GEPA 期间初始反思模型的 GPU 数与 TP。
   --num-rollout: 非零时覆盖 --num-epoch；小规模验证应使用该参数。
 
 示例：python scripts/run_qwen3_8b_seta.py --mode plan
@@ -30,7 +34,12 @@ from miles.utils.external_utils import command_utils as U
 
 # 直接以 scripts/file.py 执行时，editable 安装只暴露 miles 包；适配代码位于仓库 examples。
 sys.path.insert(0, str(U.repo_base_dir))
+from examples.seta.p2o.scoring import CollectionConfig
+from examples.seta.p2o.search import SearchConfig
 from examples.seta.remote_config import load_endpoints
+
+_COLLECTION_DEFAULTS = CollectionConfig(n_samples_per_prompt=1)
+_SEARCH_DEFAULTS = SearchConfig()
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
     save_path: str = ""
     megatron_path: str = "/root/Megatron-LM"
     num_gpus_per_node: int = 8
+    algorithm: Literal["grpo", "dapo", "p2o"] = "dapo"
+    hard_reward_threshold: float | None = None
+    gepa_trigger_unique_hard_tasks: int = _COLLECTION_DEFAULTS.gepa_trigger_unique_hard_tasks
+    gepa_dev_task_count: int = _COLLECTION_DEFAULTS.gepa_dev_task_count
+    gepa_dev_repeats: int = _COLLECTION_DEFAULTS.gepa_dev_repeats
+    gepa_concurrency: int = _SEARCH_DEFAULTS.concurrency
+    gepa_budget: int = _SEARCH_DEFAULTS.budget
+    gepa_patience: int = _SEARCH_DEFAULTS.patience
+    gepa_minibatch: int = _SEARCH_DEFAULTS.minibatch
+    gepa_reflection_max_turns: int = _SEARCH_DEFAULTS.reflection_max_turns
+    gepa_max_template_tokens: int = _SEARCH_DEFAULTS.max_template_tokens
+    gepa_reflection_num_gpus: int = 1
+    gepa_reflection_tp: int = 1
+    gepa_policy_tp: int = 1
     training_mode: Literal["async", "sync"] = "async"
     train_num_gpus: int = 0
     infer_num_gpus: int = 0
@@ -88,6 +111,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     gpu_layout: _GpuLayout = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.algorithm not in {"grpo", "dapo", "p2o"}:
+            raise ValueError("algorithm 必须为 grpo、dapo 或 p2o")
+        if self.algorithm == "p2o" and (self.training_mode != "async" or self.mode == "rollout"):
+            raise ValueError("P2O requires async training; use grpo for rollout-only debugging")
+        if any(token.split("=", 1)[0] == "--dynamic-sampling-filter-path" for token in shlex.split(self.extra_args)):
+            raise ValueError("请用 --algorithm 选择同分过滤，不要通过 extra-args 覆盖 dynamic-sampling-filter-path")
         self.gpu_layout = _resolve_gpu_layout(self)
 
     @property
@@ -97,6 +126,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     @property
     def global_batch_size(self) -> int:
         return self.rollout_batch_size * self.n_samples_per_prompt
+
+    @property
+    def train_script(self) -> str:
+        return "examples/seta/p2o/train.py" if self.algorithm == "p2o" else self.gpu_layout.train_script
 
 
 def _resolve_gpu_layout(args: ScriptArgs) -> _GpuLayout:
@@ -177,12 +210,13 @@ def _train_args(args: ScriptArgs) -> str:
         "--rollout-temperature 1 --rollout-top-p 1 --balance-data "
         "--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate "
         "--custom-agent-function-path examples.seta.agent.run --custom-rm-path examples.seta.agent.reward_func "
-        "--use-session-server --tito-model qwen3 "
+        "--use-session-server v2 --tito-model qwen3 "
+        "--session-sample-postprocessor-path examples.seta.agent.postprocess_session_samples "
         f"--session-server-workers {args.session_server_workers} --session-server-port {args.session_server_port} "
         "--apply-chat-template-kwargs '{\"enable_thinking\":false}' "
     )
     # 仅采样验证不筛选同分组，避免小样本调试因缺少奖励方差不断补采。
-    if args.mode != "rollout":
+    if args.algorithm == "dapo" and args.mode != "rollout":
         rollout += (
             "--dynamic-sampling-filter-path miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter "
         )
@@ -197,7 +231,11 @@ def _train_args(args: ScriptArgs) -> str:
         "--recompute-num-layers 1 --use-dynamic-batch-size "
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} "
     )
-    algorithm = "--advantage-estimator grpo --eps-clip 0.4 --eps-clip-high 0.4 --kl-coef 0 --kl-loss-coef 0 --entropy-coef 0 --use-tis --tis-clip 5 "
+    algorithm = (
+        "--advantage-estimator grpo --eps-clip 0.2 --eps-clip-high 0.28 "
+        "--kl-coef 0 --kl-loss-coef 0 --entropy-coef 0 --use-tis "
+        "--custom-tis-function-path miles.backends.training_utils.loss.hub.corrections.icepop_function "
+    )
     optimizer = f"--optimizer adam --lr {args.lr} --lr-decay-style constant --lr-warmup-fraction 0.001 --weight-decay 0.017 --adam-beta1 0.9 --adam-beta2 0.999 --adam-eps 1e-8 --clip-grad 1 "
     sglang = f"--rollout-num-gpus-per-engine {args.rollout_gpus_per_engine} --sglang-mem-fraction-static {args.mem_fraction} --sglang-attention-backend triton --sglang-context-length {args.sglang_context_length} --sglang-router-port {args.router_port} "
     misc = (
@@ -216,9 +254,26 @@ def _train_args(args: ScriptArgs) -> str:
         + sglang
         + misc
         + _execution_args(args.gpu_layout)
+        + _p2o_args(args)
         + debug
         + args.extra_args
     ).strip()
+
+
+def _p2o_args(args: ScriptArgs) -> str:
+    if args.algorithm != "p2o":
+        return ""
+    values = {name: value for name, value in vars(args).items() if name.startswith("gepa_")}
+    if args.hard_reward_threshold is not None:
+        values["hard_reward_threshold"] = args.hard_reward_threshold
+    return (
+        "--offload-train --rollout-function-path examples.seta.p2o.rollout.P2ORolloutFn "
+        "--use-checkpoint-opt-param-scheduler "
+        "--custom-async-data-buffer-path examples.seta.p2o.sampling.P2ODataBuffer "
+        "--custom-megatron-actor-scoring-path examples.seta.p2o.training.score_contexts "
+        + " ".join(f"--{key.replace('_', '-')} {value}" for key, value in values.items())
+        + " "
+    )
 
 
 def _worker_env(args: ScriptArgs) -> dict[str, str]:
@@ -269,7 +324,7 @@ def execute(args: ScriptArgs):
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type="qwen3-8B",
-        train_script=args.gpu_layout.train_script,
+        train_script=args.train_script,
         megatron_path=args.megatron_path,
         extra_env_vars=_worker_env(args),
         # Ctrl+C/TERM 必须停止 Ray 作业，而不只是断开日志跟随客户端。
@@ -315,7 +370,7 @@ def main(args: ScriptArgs):
         print(
             json.dumps(
                 {
-                    "train_script": args.gpu_layout.train_script,
+                    "train_script": args.train_script,
                     "gpu_layout": asdict(args.gpu_layout),
                     "train_args": _train_args(args),
                     "worker_env": _worker_env(args),

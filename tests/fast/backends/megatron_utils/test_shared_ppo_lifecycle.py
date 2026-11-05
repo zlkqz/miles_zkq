@@ -85,6 +85,39 @@ def _worker(actor_module, role, *, asleep=True):
     return worker
 
 
+def test_on_demand_hf_export_initializes_publisher_once_without_resetting_updater(actor_module, monkeypatch):
+    worker = _worker(actor_module, "actor", asleep=False)
+    worker.model = object()
+    worker.hf_config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
+    worker.snapshot_publisher = None
+    updater = worker.weight_updater = object()
+    iterator, publisher = object(), object()
+    factory = Mock(return_value=publisher)
+    getter = Mock(return_value=iterator)
+    save = Mock()
+    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda args: False)
+    monkeypatch.setattr(actor_module, "converter_model_name", lambda args, config: "qwen3")
+    monkeypatch.setattr(actor_module, "get_hf_weight_iterator", getter)
+    monkeypatch.setattr(actor_module, "SnapshotPublisher", factory)
+    monkeypatch.setattr(actor_module, "save_hf_model", save)
+
+    worker.export_hf(0, "/first")
+    worker.export_hf(1, "/second")
+
+    factory.assert_called_once_with(iterator, None)
+    assert getter.call_count == 1
+    assert getter.call_args.kwargs["required_placement"].gather_pp
+    assert getter.call_args.kwargs["quantization_config"] == worker.hf_config.quantization_config
+    assert worker.weight_updater is updater
+    assert save.call_args_list == [
+        call(worker.args, 0, worker.model, publisher=publisher, path="/first", raise_on_error=True),
+        call(worker.args, 1, worker.model, publisher=publisher, path="/second", raise_on_error=True),
+    ]
+    save.side_effect = OSError("export interrupted")
+    with pytest.raises(OSError, match="export interrupted"):
+        worker.export_hf(2, "/third")
+
+
 def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypatch):
     worker = _worker(actor_module, "critic")
     critic_output = TrainStepOutput(outcome=TrainStepOutcome.NORMAL, values=Box("cpu-values-ref"))
@@ -371,7 +404,9 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
         offload_train=True,
         rematerialize_param_from_master_weight=False,
         clear_quantized_weight_workspaces_on_offload=False,
+        disable_param_buffers_cpu_backup=False,
     )
+    worker.role = "actor"
     worker._asleep = asleep
     worker._grad_buffer_paused = False
     saver = Mock()
@@ -416,6 +451,27 @@ def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
 
     assert saver.resume.call_count == 1
     assert worker._asleep is False
+
+
+def test_wake_up_restores_discarded_parameters_before_publication(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    worker.args.disable_param_buffers_cpu_backup = True
+    monkeypatch.setattr(type(worker), "_enable_weight_backup", property(lambda _self: True))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    live = {"w": torch.zeros(4)}
+    expected = torch.arange(4, dtype=torch.float32)
+    backuper = TensorBackuper.create(lambda: iter(live.items()))
+    backuper._backups["actor"] = {"w": expected.clone()}
+    worker.weights_backuper = backuper
+    worker._active_model_tag = "actor"
+
+    worker.wake_up()
+    assert torch.equal(live["w"], expected)
+    # A resident wake is idempotent and must not overwrite a subsequent update.
+    live["w"].add_(1)
+    worker.wake_up()
+    assert torch.equal(live["w"], expected + 1)
+    saver.resume.assert_called_once_with(tag=None)
 
 
 def test_lora_sleep_pauses_the_grad_buffers_and_wake_up_resumes_them(actor_module, monkeypatch):
@@ -1245,3 +1301,32 @@ def test_actor_weight_getter_forwards_companion_selection_to_live_source(
     if use_tms_backup:
         expected["translate_gpu_to_cpu"] = True
     worker._named_actor_weights.assert_called_once_with(**expected)
+
+
+def test_actor_scoring_hook_runs_after_old_selection_and_before_advantages(actor_module, monkeypatch):
+    worker = _actor_reuse_worker(actor_module, custom_megatron_actor_scoring_path="test.scorer")
+    _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
+    data = {"num_rollouts": [1], "total_lengths": [3]}
+    events = []
+    worker._switch_model.side_effect = lambda tag: events.append(("select", tag))
+    worker._compute_log_prob.side_effect = lambda *a, store_prefix, **k: {f"{store_prefix}log_probs": [store_prefix]}
+
+    def scorer(args, values, *, score):
+        events.append(("score", args is worker.args))
+        assert values is data and events[0] == ("select", "actor")
+        values["importance_log_probs"] = score(values, "aug_")["aug_log_probs"]
+        values["log_probs"] = score(values, "")["log_probs"]
+        values["total_lengths"] = [2]
+
+    monkeypatch.setattr(actor_module, "load_function", lambda path: scorer)
+
+    def advantages(args, values):
+        events.append(("advantages", values["total_lengths"]))
+        assert values["importance_log_probs"] == ["aug_"]
+        assert values["log_probs"] == [""]
+
+    actor_module.compute_advantages_and_returns.side_effect = advantages
+    worker._train_actor(7, data, witness_info=None, attempt=0)
+    assert events == [("select", "actor"), ("score", True), ("advantages", [2])]
+    assert worker._compute_log_prob.call_count == 2
+    actor_module.train.assert_called_once()

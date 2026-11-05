@@ -54,8 +54,9 @@ nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l
   --custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate
   --custom-agent-function-path examples.seta.agent.run
   --custom-rm-path examples.seta.agent.reward_func
-  --use-session-server
+  --use-session-server v2
   --tito-model qwen3
+  --session-sample-postprocessor-path examples.seta.agent.postprocess_session_samples
   --session-server-workers 8
   --session-server-port 30000
   --apply-chat-template-kwargs '{"enable_thinking":false}'
@@ -73,13 +74,13 @@ nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l
   --use-dynamic-batch-size
   --max-tokens-per-gpu 32768
   --advantage-estimator grpo
-  --eps-clip 0.4
-  --eps-clip-high 0.4
+  --eps-clip 0.2
+  --eps-clip-high 0.28
   --kl-coef 0
   --kl-loss-coef 0
   --entropy-coef 0
   --use-tis
-  --tis-clip 5
+  --custom-tis-function-path miles.backends.training_utils.loss.hub.corrections.icepop_function
   --optimizer adam
   --lr 1.7e-05
   --lr-decay-style constant

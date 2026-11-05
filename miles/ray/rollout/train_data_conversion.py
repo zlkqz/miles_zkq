@@ -485,6 +485,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rollout_routed_experts",
             "rollout_indexer_topk",
             "prompt",
+            "metadata",
             "teacher_log_probs",
             "opd_reverse_kl",
             "seq_witness_ids",

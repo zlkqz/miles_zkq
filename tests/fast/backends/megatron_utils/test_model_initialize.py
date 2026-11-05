@@ -129,6 +129,7 @@ def _mock_megatron_environment():
             {
                 "load_checkpoint": MagicMock(),
                 "save_checkpoint": MagicMock(),
+                "get_checkpoint_name": MagicMock(),
             },
         )
         _stub_module("sglang.srt.debug_utils", is_package=True)

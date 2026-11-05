@@ -13,12 +13,11 @@ Example:
         --config /path/to/launcher_config.json
 """
 
+import argparse
 import json
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from tap import Tap
 
 import miles.utils.external_utils.command_utils as U
 
@@ -246,12 +245,10 @@ def execute(args: ScriptArgs) -> None:
     )
 
 
-class _CLI(Tap):
-    config: Path
-
-
 def main() -> None:
-    cli = _CLI().parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    cli = parser.parse_args()
     execute(ScriptArgs(**json.loads(cli.config.read_text())))
 
 

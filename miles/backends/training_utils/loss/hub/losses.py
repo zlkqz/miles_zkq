@@ -140,6 +140,11 @@ def policy_loss_function(
         old_log_probs = trainer_scored_log_probs
     train_log_probs_list = log_probs
     old_log_probs_list = old_log_probs
+    importance_scored_log_probs = (
+        [value.detach() for value in batch["importance_log_probs"]]
+        if batch.get("importance_log_probs") is not None
+        else trainer_scored_log_probs
+    )
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -212,6 +217,15 @@ def policy_loss_function(
         ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
     )
 
+    pg_weights = batch.get("pg_loss_weights")
+    if pg_weights is not None:
+        # Numerator-only weights: keep original episode/action denominators and
+        # leave entropy, KL, advantages and off-policy importance ratios alone.
+        pg_weights = torch.cat([value.detach() for value in pg_weights], dim=0)
+        if pg_weights.shape != pg_loss.shape:
+            raise ValueError("policy loss weights must align with local response tokens")
+        pg_loss = pg_loss * pg_weights
+
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
 
@@ -253,7 +267,7 @@ def policy_loss_function(
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
-            "train_log_probs": trainer_scored_log_probs,
+            "train_log_probs": importance_scored_log_probs,
             "rollout_log_probs": rollout_old_log_probs,
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,
@@ -347,7 +361,9 @@ def policy_loss_function(
         # The loss baseline may be rollout log-probs. Diagnostics must use an
         # independently scored trainer policy, even in that case.
         train_scored_log_probs = (
-            torch.cat(trainer_scored_log_probs, dim=0) if trainer_scored_log_probs is not None else log_probs.detach()
+            torch.cat(importance_scored_log_probs, dim=0)
+            if importance_scored_log_probs is not None
+            else log_probs.detach()
         )
         rollout_log_probs = torch.cat(rollout_old_log_probs, dim=0)
         abs_diff = (train_scored_log_probs - rollout_log_probs).abs()
@@ -375,6 +391,9 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+    if pg_weights is not None:
+        reported_loss["pg_loss_weight"] = sum_of_sample_mean(pg_weights).detach()
+        reported_loss["pg_loss_zero_weight_fraction"] = sum_of_sample_mean((pg_weights == 0).float()).detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

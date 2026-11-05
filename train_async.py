@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
-async def train(args, *, disposer: Disposer):
+async def train(args, *, disposer: Disposer, phase_factory=None):
     assert not args.colocate or args.fully_async, "Colocation is only supported for async training with --fully-async."
     validate_async_off_policy_correction(args)
     _worker_manager = init_orchestration_script(args, disposer=disposer)
@@ -56,6 +56,15 @@ async def train(args, *, disposer: Disposer):
 
     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
     disposer.add(eval_dispatcher.drain)
+    phase_handler = (
+        phase_factory(
+            args, manager=_worker_manager, actor=actor_model, inference=inference_controller, executor=rollout_executor
+        )
+        if phase_factory is not None
+        else None
+    )
+    if phase_handler is not None and (not args.fully_async or args.colocate or args.use_critic):
+        raise ValueError("Training phases currently require disaggregated fully-async actor training")
 
     if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
@@ -81,11 +90,24 @@ async def train(args, *, disposer: Disposer):
         return await rollout_executor.get(rollout_id)
 
     # async train loop.
-    rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
+    rollout_data_next_future = (
+        await eager_create_task(prepare_and_generate(args.start_rollout_id)) if phase_handler is None else None
+    )
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
-        if rollout_data_next_future is not None:
+        if phase_handler is not None:
+            # The producer remains asynchronous; only training-batch consumption
+            # stays at the driver boundary so a phase never races an update/eval.
+            while True:
+                rollout_data_curr_ref = await prepare_and_generate(rollout_id)
+                if not rollout_data_curr_ref.phase_boundary:
+                    break
+                await eval_dispatcher.drain()
+                await phase_handler.run(rollout_id - 1)
+        elif rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
+            if getattr(rollout_data_curr_ref, "phase_boundary", False):
+                raise RuntimeError("Rollout requested a phase but this driver has no phase handler")
 
         has_next_rollout = rollout_id + 1 < args.num_rollout
         weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
@@ -101,7 +123,7 @@ async def train(args, *, disposer: Disposer):
                 await inference_controller.offload_weights()
         else:
             # Start the next rollout early.
-            if has_next_rollout and not defer_next_drain:
+            if has_next_rollout and not defer_next_drain and phase_handler is None:
                 rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if args.use_critic:
@@ -122,10 +144,13 @@ async def train(args, *, disposer: Disposer):
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
             force_sync = external_save or rollout_id == args.num_rollout - 1
-            await save_training_model(actor_model, rollout_id, force_sync)
-            if args.use_critic:
-                await save_training_model(critic_model, rollout_id, force_sync)
-            await rollout_executor.save(rollout_id)
+            if phase_handler is not None:
+                await phase_handler.save(rollout_id)
+            else:
+                await save_training_model(actor_model, rollout_id, force_sync)
+                if args.use_critic:
+                    await save_training_model(critic_model, rollout_id, force_sync)
+                await rollout_executor.save(rollout_id)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
@@ -139,7 +164,7 @@ async def train(args, *, disposer: Disposer):
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
             await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
-            if defer_next_drain and not args.colocate:
+            if defer_next_drain and not args.colocate and phase_handler is None:
                 rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
         if args.colocate:
             if args.offload_rollout:

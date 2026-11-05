@@ -16,12 +16,17 @@ docker exec -it miles_seta_zhangkaiqi2024 bash
 
 ```bash
 cd /ceph_home/zhangkaiqi2024/miles
-bash my_scripts/run_seta.sh
+# GRPO：关闭组内同分过滤
+bash my_scripts/run_seta_grpo.sh
+# DAPO 对照：开启组内同分过滤
+# bash my_scripts/run_seta_dapo.sh
 ```
+
+旧入口 `run_seta.sh` 默认等同 DAPO；Python 的 `--algorithm grpo|dapo` 控制该开关，其他训练参数一致。两组共同使用 IcePop，配置细节见[训练说明](seta_miles.md#44-验证动态补采和-grpo)。
 
 默认全量 4,567 条数据和 W&B online。外部 export 可覆盖脚本默认值；只看配置用 `MODE=plan bash my_scripts/run_seta.sh`。同一专用容器只运行一份训练。
 
-训练默认纯异步，单机 8 卡自动分成 4 卡训练 + 4 卡推理。同步/异步、卡数和多机配置见 [第 4 节](#4-常用调整与多机注意)。默认实验名包含 `async_grpo` 或 `sync_grpo`，两种模式使用独立 checkpoint 目录；显式设置 EXP_NAME 或 SAVE_PATH 可指定恢复路径。`MODE=rollout` 仍使用全部 GPU 做采样验证。
+训练默认纯异步，单机 8 卡自动分成 4 卡训练 + 4 卡推理。同步/异步、卡数和多机配置见 [第 4 节](#4-常用调整与多机注意)。默认实验名包含训练模式与实验组，例如 `async_grpo`、`async_dapo` 或 `sync_grpo`；各组合使用独立 checkpoint 目录；显式设置 EXP_NAME 或 SAVE_PATH 可指定恢复路径。`MODE=rollout` 仍使用全部 GPU 做采样验证。
 
 - checkpoint：SAVE_PATH，默认 `/ceph_home/zhangkaiqi2024/saved_models/p2o-agent/$EXP_NAME`；相同实验名重跑加载已有 checkpoint。
 - 训练日志：`seta_miles_runtime/runs/$EXP_NAME/logs/${EXP_NAME}_${RUN_ID}.log`。EXP_NAME 不含时间戳，RUN_ID 区分每次启动。

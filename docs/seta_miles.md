@@ -123,7 +123,7 @@ run_seta.sh 设置默认变量，外部 export 可覆盖；EXP_NAME 表示实验
 
 Python 启动器检查模型、JSONL、所有 endpoint 的 health、协议与容量，生成 Qwen 结构参数和训练参数。command_utils.execute_train 负责 Ray 启动与 job 提交；async 选择 train_async.py 和 --fully-async，sync 选择 train.py 和 --colocate，仅采样模式使用 train.py 的 debug-rollout-only。卡数和训练拓扑由 Python 启动器统一推导，shell 仅传入配置；同步/异步开关、全局 train/infer 卡数与多机接入步骤见 [Quick Start 第 4 节](seta_quick_start.md#4-常用调整与多机注意)。
 
-异步模式中，Megatron 和 SGLang 使用独立 GPU，后台采样持续生成任务组，训练从完成缓冲区取出一批后更新。权重同步采用默认 broadcast，每次训练更新后短暂以 in_place 暂停推理，保留 KV cache 后恢复；训练计算期间采样继续。异步轨迹可能跨越权重版本，沿用配方的 TIS 校正；缓冲、陈旧度和调度细节见 [Fully Async RL](user-guide/fully-async.md)。同步模式中，两者分时复用全部 GPU，完成采样、训练和权重同步后才开始下一批。Ray 管理进程、资源和数据引用；不解析任务、不操作终端、不计算测试通过率。
+异步模式中，Megatron 和 SGLang 使用独立 GPU，后台采样持续生成任务组，训练从完成缓冲区取出一批后更新。权重同步采用默认 broadcast，每次训练更新后短暂以 in_place 暂停推理，保留 KV cache 后恢复；训练计算期间采样继续。异步轨迹可能跨越权重版本，使用配方中的 IcePop 重要性修正；缓冲、陈旧度和调度细节见 [Fully Async RL](user-guide/fully-async.md)。同步模式中，两者分时复用全部 GPU，完成采样、训练和权重同步后才开始下一批。Ray 管理进程、资源和数据引用；不解析任务、不操作终端、不计算测试通过率。
 
 ### 4.2 任务组 → session → HTTP episode
 
@@ -147,13 +147,15 @@ non-thinking 由 enable_thinking=false 控制；Terminus XML 中的 analysis/pla
 
 progress.py 优先读取保存的 ctrf.json，否则解析 pytest 摘要，得到逐测试通过/失败。有效零分是正常奖励；缺失验证报告、构建失败、模型连接故障等标为无效，Sample 为 ABORTED，整组丢弃。
 
-正式训练默认还过滤同任务全部轨迹奖励相同的组，继续补采直到收齐有效任务组。这是动态筛选，不是准备阶段过滤 4,567 条数据。128 条是有效轨迹目标，实际启动 episode 数可能更多。
+实验组由 Python 启动器的 `--algorithm` 决定：GRPO 关闭同分过滤，DAPO 开启 `apply_reward_nonzero_std_filter`，旧 `run_seta.sh` 默认 DAPO。过滤开启时，同任务全部轨迹奖励相同的组被过滤并继续补采；关闭时有效全零/全同分组可以进入训练，其 GRPO 优势通常为零。这是动态筛选，不是准备阶段过滤 4,567 条数据。128 条是有效轨迹目标，实际启动 episode 数可能更多。
 
-训练将 Sample 转成 tokens、长度、loss mask、奖励和 rollout log-prob；同组奖励经 GRPO 归一化得到优势。Megatron 重算固定轨迹的 token 概率，计算带 clip 的策略 loss/TIS，组织 microbatch、反向传播和优化器更新，再将 actor 权重同步到 SGLang。不会每步重新导出 HF 模型并重启推理。
+两组共同使用 `--use-tis` 加内置 `icepop_function`，范围继承核心默认 `[0,2]`：范围内按实际重要性比率加权，范围外该 token 的 policy-gradient 项置零，原 loss mask 分母不变。PPO surrogate clip 由启动器显式设置为 `[0.8,1.28]`（epsilon 为 0.2/0.28）；它与 IcePop 是不同的比率和处理步骤。可通过 `--extra-args` 覆盖数值，但同分过滤必须通过 `--algorithm` 选择。
+
+训练将 Sample 转成 tokens、长度、loss mask、奖励和 rollout log-prob；同组奖励经 GRPO 归一化得到优势。v2收集阶段通过SETA后处理钩子复用默认叶路径mask归属规则，并执行与reward_func相同的验证有效性检查；无效结果标为ABORTED，有效零分保持有效，全通过bonus不变。Megatron 重算固定轨迹的 token 概率，计算 PPO clipped surrogate 和 IcePop 修正，组织 microbatch、反向传播和优化器更新，再将 actor 权重同步到 SGLang。不会每步重新导出 HF 模型并重启推理。
 
 ## 5. 最终轨迹如何参与训练
 
-当前 session v1 线性路径将一条 episode 合成一个 Sample，不把每个终端 step 拆成独立训练样本。例如：
+当前启动器使用 session v2。连续追加且没有分支的多轮 episode 仍合成一个叶路径 Sample，不按每个终端 step 拆开。v2记录树状历史；若存在保留的多条叶路径，沿用 Miles 的同一 rollout/episode 标识、组语义和共享动作只训练一次的 mask 规则，不能把每个叶子当成独立环境尝试。线性轨迹例如：
 
 ```text
 模型调用 1：P → A1
@@ -189,7 +191,7 @@ GPU 调试产物在 `runs/<EXP_NAME>/dump_details/`：trajectory JSONL 便于阅
 
 新增 SetaTerminus2 仅捕获已知上下文/序列/单轮长度预算异常：**结束 agent 后继续验证已有环境状态**，不伪造续写、不修改截断回复、不启用摘要。这样预算耗尽的有效尝试仍有真实部分通过奖励；未知模型故障、构建异常与取消不会伪装为正常完成。这是本次迁移明确的终止策略。
 
-若以后开启压缩，压缩前后请求不再共享同一个 token 前缀，不能强行拼成线性训练样本。需要用 session v2/树状记录或显式拆分上下文片段，保留每段实际输入、采样概率和 loss mask；同一环境 episode 的最终奖励可分配给这些片段，并保持原 episode 分组。外部摘要作为条件时 mask=0；若训练策略自己生成摘要，其 token 是否参与 loss 则需显式设计。当前没有实现或验证压缩训练。
+若以后开启压缩，压缩前后请求不再共享同一个 token 前缀，不能强行拼成线性训练样本。虽然当前已使用 session v2，仍需单独验证压缩后的叶路径、实际输入、采样概率和 loss mask；同一环境 episode 的最终奖励可分配给这些片段，并保持原 episode 分组。外部摘要作为条件时 mask=0；若训练策略自己生成摘要，其 token 是否参与 loss 则需显式设计。当前没有实现或验证压缩训练。
 
 此前核对原 SETA Qwen3-8B/AReaL 配方：使用 CAMEL AgentTrain，threshold=None，固定 CAMEL 提交 `57d2f98bc315f1522269a4cad7b2a478cfee3b12` 的摘要检查因此直接返回；默认窗口也不裁剪旧历史。证据见原训练配置及[固定版本 ChatAgent](https://github.com/camel-ai/camel/blob/57d2f98bc315f1522269a4cad7b2a478cfee3b12/camel/agents/chat_agent.py)。论文 A.7 的终端输出截断不等于历史摘要，因此当前不为对齐该入口开启压缩。
 
@@ -267,7 +269,7 @@ Miles 也有通过 Bridge 直接读 HF 的路径，但本启动器选择已验�
 
 此前 22,835 来自一次计算 4567×40÷8，取整次序不符，已纠正。动态补采增加环境执行次数，因此不保证每条任务恰好训练 40 次。NUM_ROLLOUT 正数覆盖 epoch 总批次预算；续训读取已完成批次，不表示“再额外跑 N 批”。
 
-这是一份迁移配方，不是严格数值复刻：论文/原入口使用 AReaL、CAMEL、过滤后 560 任务；本实验使用 Miles、Terminus-2、完整 4,567 任务。组内 GRPO 归一化、TIS cap=5 不等同于逐项复制 AReaL 的优势处理与 decoupled loss。每轮输出上限与线性序列预算按当前启动器设置，没有另设论文总生成 10,240 token 预算。
+这是一份迁移配方，不是严格数值复刻：论文/原入口使用 AReaL、CAMEL、过滤后 560 任务；本实验使用 Miles、Terminus-2、完整 4,567 任务。组内 GRPO 归一化和当前 IcePop 配置不等同于逐项复制 AReaL 的优势处理与 decoupled loss。每轮输出上限与线性序列预算按当前启动器设置，没有另设论文总生成 10,240 token 预算。
 
 当前工具镜像的 FlashAttention 4 在 A100 前向可运行、反向会报 unsupported compute capability；尝试 fused 时当前输入布局也没有可用后端。初始化时移除 flash-attn-4，保留已有 FA2，训练维持 ATTENTION_BACKEND=flash，推理保持 triton。FA2 已单独进行真实 CUDA 前向/反向检查；该环境兼容处理不改变 agent、奖励或 GRPO 算法。
 
@@ -286,7 +288,7 @@ Miles 也有通过 Bridge 直接读 HF 的路径，但本启动器选择已验�
 | 沙盒独立目录 | /opt/seta-zhangkaiqi2024，位于 /dev/sdg3 ext4，不是 Ceph |
 | 远端代码 / 任务 | root/miles 与 root/tasks；4,567 任务独立副本 |
 | 远端运行依赖 | root/python 的 3.13.16、root/miles 下独立 Harbor .venv |
-| 远端服务 | seta-harbor-zkq，端口 18080，容量 16 |
+| 远端服务 | seta-harbor-zkq，端口 18080；2026-11-04 更新为容量 32 |
 | 远端账号 | seta-sandbox-zkq，home 在 root/home，运行时禁止访问 /ceph_home |
 | GPU 服务 | seta-training-zkq；操作见 Quick Start |
 
@@ -294,7 +296,7 @@ Miles 也有通过 Bridge 直接读 HF 的路径，但本启动器选择已验�
 
 GPU 宿主机使用 systemd cgroup driver，实际遇到 daemon-reload 后容器 NVML Unknown Error；最终容器增加显式 NVIDIA 设备映射，避免依赖 runtime hook 的隐式设备权限。此问题与训练脚本收到 SIGHUP、容器 restart 策略是不同层级，详见 Quick Start 的创建命令。
 
-真实远端参考解检查：nl2bash__004 通过 10/10，奖励 1.2；真实 Qwen 多轮请求已经跨机器执行，最近一组奖励为 0.2、0.2、0.2、0.7。为避免早期同分组不断补采，最小检查曾临时关闭同分组过滤，保留真实奖励；正式配置仍为默认动态过滤和全量任务。
+真实远端参考解检查：nl2bash__004 通过 10/10，奖励 1.2；真实 Qwen 多轮请求已经跨机器执行，最近一组奖励为 0.2、0.2、0.2、0.7。为避免早期同分组不断补采，最小检查曾临时关闭同分组过滤，保留真实奖励；该历史检查采用全量数据入口默认动态过滤；当前 GRPO/DAPO 可分别控制过滤。
 
 远端镜像下载已额外验证：同一份持久 service.env 配置下，通过镜像站下载 python:3.13-slim，导入 daemon 并 tag 回原引用成功；证据为 base_image_mirror_check.log。Docker CPU/代理/独立挂载的实测证据保留在 remote_cpu_proxy_proof.json。
 
@@ -325,3 +327,5 @@ GPU 宿主机使用 systemd cgroup driver，实际遇到 daemon-reload 后容器
 这是按并发增长的默认保护预算，不是实测容量预测或资源预留。CPU/内存限制覆盖 Harbor 服务及其 Python/CLI 子进程，不覆盖 Docker daemon 独立创建的任务容器。单个任务继续由 task.toml 声明资源；不注入统一的任务资源覆盖值。磁盘值是 state_dir 所在文件系统的剩余空间接单阈值，不是单任务磁盘上限，也无法单凭并发预测基础镜像的大小。
 
 修改并发后，先停止使用该节点的训练，再按 Quick Start 执行 apply。旧配置若仍保留上述三个字段，会明确报错并要求删除，避免误以为手工值仍在生效。image_cache_keep 仍独立控制本服务任务镜像缓存数量。
+
+2026-11-04：按当前部署配置将144专用服务容量由16更新为32；setup.py部署及鉴权/协议/容量/服务状态检查通过，更新后活动任务0。G1基线验收和短训练的后续证据统一记录在[P2O实现进度](p2o_implementation_progress.md)，不以健康检查代替真实训练验收。
