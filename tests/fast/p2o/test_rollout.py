@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 from examples.seta.p2o.rollout import P2ORolloutFn
-from tests.fast.p2o.test_sampling import source
+from tests.fast.p2o.test_sampling import completed, finish_cycle, source
 from tests.fast.rollout.test_fully_async_rollout import FakeGenerateState, make_args
 
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
@@ -70,6 +70,47 @@ def test_rollout_state_roundtrip_includes_prefetch_rng_and_native_cursors(monkey
     other.data_source.load(tmp_path / "data")
     other.load(tmp_path / "fn")
     for _ in range(17):
+        assert [[s.to_dict() for s in b] for b in fn._next_prompt_groups()] == [
+            [s.to_dict() for s in b] for b in other._next_prompt_groups()
+        ]
+
+
+async def test_checkpoint_restores_all_cycles_scores_assignments_pending_tasks_and_buffer(monkeypatch, tmp_path):
+    config = dict(gepa_trigger_unique_hard_tasks=2, gepa_dev_task_count=1)
+    fn = make_fn(monkeypatch, **config)
+    finish_cycle(fn.owner, [100, 101], texts=("first low", "first high"))
+    finish_cycle(fn.owner, [102, 103], texts=("second low", "second high"))
+    # An unsuccessful cycle keeps old assignments and still records hard identity.
+    finish_cycle(fn.owner, [100, 104], texts=())
+    pending = completed(fn.data_source, fn.owner, 105, templated=False)
+    assert fn.owner.observe(pending).added
+    await fn._output.put(pending)
+    retry = completed(fn.data_source, fn.owner, 106, templated=False)
+    fn._retry_buffer.append(retry.prompt_group)
+    fn._next_prompt_groups()  # drains retry first
+    fn._next_prompt_groups()  # leaves prefetched and displaced natural tasks
+    assert fn.windows.ready and fn.windows.displaced
+    fn._retry_buffer.append(retry.prompt_group)
+    fn.data_source.save(tmp_path / "data")
+    fn.save(tmp_path / "fn")
+
+    other = make_fn(monkeypatch, **config)
+    other.data_source.load(tmp_path / "data")
+    other.load(tmp_path / "fn")
+    assert other.owner.snapshot() == fn.owner.snapshot()
+    assert len(other.owner.history) == 4
+    assert len(other.owner.history.snapshot().cycles) == 3
+    assert other.owner.collector.hard_task_count == 1
+    assert other.windows.state_dict() == fn.windows.state_dict()
+    assert other._output.state_dict() == fn._output.state_dict()
+    assert [[s.to_dict() for s in b] for b in other._retry_buffer] == [
+        [s.to_dict() for s in b] for b in fn._retry_buffer
+    ]
+    # Derived normalization/solver eligibility is rebuilt from the saved evidence.
+    for task in fn.owner.catalog:
+        assert other.owner.history.probabilities(task) == fn.owner.history.probabilities(task)
+        assert other.owner.priority(task) == fn.owner.priority(task)
+    for _ in range(24):
         assert [[s.to_dict() for s in b] for b in fn._next_prompt_groups()] == [
             [s.to_dict() for s in b] for b in other._next_prompt_groups()
         ]

@@ -39,9 +39,6 @@ class P2ORolloutFn(FullyAsyncRolloutFn):
         search = SearchConfig()
         for name, default in vars(search).items():
             parser.add_argument("--gepa-" + name.replace("_", "-"), type=int, default=default)
-        parser.add_argument("--gepa-reflection-num-gpus", type=int, default=1)
-        parser.add_argument("--gepa-reflection-tp", type=int, default=1)
-        parser.add_argument("--gepa-policy-tp", type=int, default=1)
 
     def __init__(self, input):
         super().__init__(input)

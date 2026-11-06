@@ -17,7 +17,9 @@ def args(tmp_path):
     (model / "config.json").write_text("{}")
     data = tmp_path / "train.jsonl"
     data.write_text("{}\n")
-    return SimpleNamespace(
+    from tests.fast.ray.rollout.conftest import make_args
+
+    return make_args(
         save=str(tmp_path / "save"),
         load=str(tmp_path / "save"),
         hf_checkpoint=str(model),
@@ -40,9 +42,7 @@ def args(tmp_path):
         actor_num_gpus_per_node=4,
         rollout_num_gpus=4,
         num_gpus_per_node=8,
-        gepa_reflection_num_gpus=1,
-        gepa_reflection_tp=1,
-        gepa_policy_tp=1,
+        rollout_num_gpus_per_engine=2,
         rollout_seed=12,
         **{"gepa_" + k: v for k, v in vars(SearchConfig()).items()},
     )
@@ -55,10 +55,10 @@ def test_preflight_validates_before_gpu_allocation(tmp_path):
     with pytest.raises(ValueError, match="search-train"):
         driver.prepare_resume(a)
     a.gepa_trigger_unique_hard_tasks = 4
-    a.gepa_policy_tp = 2
+    a.rollout_num_gpus_per_engine = 3
     with pytest.raises(ValueError, match="divisible"):
         driver.prepare_resume(a)
-    a.gepa_policy_tp = 1
+    a.rollout_num_gpus_per_engine = 2
     a.use_checkpoint_opt_param_scheduler = False
     with pytest.raises(ValueError, match="saved schedule"):
         driver.prepare_resume(a)
@@ -138,6 +138,9 @@ async def test_phase_order_restore_and_only_resume_after_post_checkpoint(tmp_pat
         def __init__(self, **kwargs):
             pass
 
+        def timing(self, event):
+            pass
+
         def finish(self, state):
             events.append("metrics")
 
@@ -155,6 +158,9 @@ async def test_phase_order_restore_and_only_resume_after_post_checkpoint(tmp_pat
         with pytest.raises(OSError, match="interrupted"):
             await handler.run(2)
         assert "resume" not in events and "post_gepa" not in events and "restore" in events
+        timing = json.loads((tmp_path / "save/gepa/cycle_000001/timing.json").read_text())
+        assert timing["summary"]["phase_total"]["failed"] == 1
+        assert timing["summary"]["resource_restore"]["completed"] == 1
     else:
         await handler.run(2)
         assert events == [
@@ -170,6 +176,12 @@ async def test_phase_order_restore_and_only_resume_after_post_checkpoint(tmp_pat
             "post_gepa",
             "resume",
         ]
+
+        timing = json.loads((tmp_path / "save/gepa/cycle_000001/timing.json").read_text())
+        assert timing["summary"]["phase_total"]["completed"] == 1
+        assert {"pre_checkpoint", "resource_enter", "search_total", "resource_restore", "post_checkpoint"} <= timing[
+            "summary"
+        ].keys()
 
 
 def test_fresh_native_reference_fallback_is_not_a_baseline_resume(tmp_path):

@@ -2,7 +2,8 @@
 
 The planner never allocates a second placement group, assumes a global CUDA
 index, or changes the normal trainer topology. Each temporary engine stays on
-one node. Policy TP defaults to one so an odd GPU remainder is usable.
+one node, with the same GPU count as a normal rollout engine. Exactly one
+engine is reserved for reflection; the remaining engines serve policy.
 """
 
 from dataclasses import dataclass
@@ -31,25 +32,21 @@ class EnginePlacement:
         return self.devices[0].slot
 
 
-def plan_gepa_placement(slots, *, reflection_num_gpus=1, reflection_tp=1, policy_tp=1):
-    """Partition every owned device exactly once; reject untileable layouts."""
+def plan_gepa_placement(slots, *, rollout_gpus_per_engine):
+    """Tile owned devices like training rollout; reserve exactly one reflection engine."""
     devices = tuple(GpuSlot(**slot) if isinstance(slot, dict) else slot for slot in slots)
-    for name, value in (
-        ("reflection_num_gpus", reflection_num_gpus),
-        ("reflection_tp", reflection_tp),
-        ("policy_tp", policy_tp),
-    ):
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    if not reflection_num_gpus < len(devices) or reflection_num_gpus % reflection_tp:
-        raise ValueError("Reflection must leave policy GPUs and be divisible by reflection TP")
+    tp = rollout_gpus_per_engine
+    if type(tp) is not int or tp < 1:
+        raise ValueError("rollout_gpus_per_engine must be a positive integer")
+    if tp >= len(devices):
+        raise ValueError("One reflection engine must leave at least one policy engine")
     if [device.slot for device in devices] != list(range(len(devices))):
         raise ValueError("GPU slots must preserve Miles' full, ordered placement")
     identities = {(device.node_id, device.physical_gpu_id) for device in devices}
     if len(identities) != len(devices):
         raise ValueError("Duplicate physical devices in owned GPU slots")
-    policy_devices, reflection_devices = devices[:-reflection_num_gpus], devices[-reflection_num_gpus:]
-    return tuple(_tile(policy_devices, "policy", policy_tp) + _tile(reflection_devices, "reflection", reflection_tp))
+    engines = _tile(devices, "policy", tp)
+    return tuple([*engines[:-1], EnginePlacement("reflection", engines[-1].devices)])
 
 
 def _tile(devices, role, tp):

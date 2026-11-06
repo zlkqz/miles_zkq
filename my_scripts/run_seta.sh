@@ -91,7 +91,9 @@ export SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-32768}"
 
 # ── 奖励、优化与保存 ────────────────────────────────────────────────────────
 export FULL_PASS_BONUS="${FULL_PASS_BONUS:-0.2}"
-export LR="${LR:-1.7e-5}"
+export LR="${LR:-1e-6}"
+export WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+export MAX_WEIGHT_STALENESS="${MAX_WEIGHT_STALENESS:-4}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-30}"
 
 # ── 模型服务与端口 ──────────────────────────────────────────────────────────
@@ -298,6 +300,7 @@ _start_seta() {
     --session-server-port "$SESSION_SERVER_PORT" --router-port "$ROUTER_PORT" \
     --session-server-external-host "$SESSION_SERVER_EXTERNAL_HOST" \
     --full-pass-bonus "$FULL_PASS_BONUS" --save-interval "$SAVE_INTERVAL" --lr "$LR" \
+    --weight-decay "$WEIGHT_DECAY" --max-weight-staleness "$MAX_WEIGHT_STALENESS" \
     --extra-env-vars "$WORKER_ENV_JSON" --extra-args "$MILES_EXTRA_ARGS" \
     "$@" \
     --algorithm "$SETA_ALGORITHM" \

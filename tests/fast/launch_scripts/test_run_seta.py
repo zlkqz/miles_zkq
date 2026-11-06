@@ -228,6 +228,9 @@ def test_shell_plan_passes_mode_and_global_counts_without_starting_a_job(
         ROLLOUT_GPUS_PER_ENGINE="2",
         EXTRA_ARGS="",
         EXTRA_ENV_VARS="{}",
+        LR="1e-6",
+        WEIGHT_DECAY="0.01",
+        MAX_WEIGHT_STALENESS="4",
     )
     env.update(settings)
     result = subprocess.run(
@@ -246,6 +249,11 @@ def test_shell_plan_passes_mode_and_global_counts_without_starting_a_job(
     assert plan["gpu_layout"]["actor_num_gpus_per_node"] == actor_gpus
     assert plan["gpu_layout"]["infer_num_gpus"] == infer_gpus
     argv = shlex.split(plan["train_args"])
+    assert float(_flag(argv, "--lr")) == 1e-6
+    assert float(_flag(argv, "--weight-decay")) == 0.01
+    assert _flag(argv, "--max-weight-staleness") == "4"
+    assert _flag(argv, "--lr-decay-style") == "constant"
+    assert _flag(argv, "--lr-warmup-fraction") == "0"
     assert ("--dynamic-sampling-filter-path" in argv) == (algorithm == "dapo")
     assert f"_{env['TRAINING_MODE']}_{algorithm}_" in _flag(argv, "--save")
     assert not (tmp_path / "remote/active_run.json").exists()
@@ -262,7 +270,8 @@ def test_p2o_uses_native_async_topology_and_exact_algorithm_hooks(launcher, monk
     assert args.dynamic_sampling_filter_path is None and args.offload_train
     assert (args.gepa_trigger_unique_hard_tasks, args.gepa_dev_task_count, args.gepa_dev_repeats) == (64, 16, 4)
     assert (args.gepa_concurrency, args.gepa_budget, args.gepa_patience) == (16, 256, 32)
-    assert (args.gepa_reflection_num_gpus, args.gepa_reflection_tp, args.gepa_policy_tp) == (1, 1, 1)
+    assert args.rollout_num_gpus_per_engine == 2
+    assert not any(name.startswith("--gepa-") and ("-tp" in name or "-gpus" in name) for name in argv)
     assert (args.p2o_task_mix_ratio, args.p2o_max_template_ratio) == (0.25, 0.5)
     assert args.fully_async and args.actor_num_gpus_per_node == 4 and args.rollout_num_gpus == 4
     assert (args.tis_clip_low, args.tis_clip) == (0, 2)
@@ -292,3 +301,21 @@ def test_p2o_passes_full_native_validation(launcher, monkeypatch):
     assert args.rollout_function_path == "examples.seta.p2o.rollout.P2ORolloutFn"
     assert args.eval_function_path == args.rollout_function_path
     assert args.namespaced_radix_cache and args.fully_async
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "dapo", "p2o"])
+def test_shared_training_defaults_and_explicit_overrides(launcher, algorithm):
+    argv = shlex.split(launcher._train_args(launcher.ScriptArgs(algorithm=algorithm)))
+    assert float(_flag(argv, "--lr")) == 1e-6
+    assert float(_flag(argv, "--weight-decay")) == 0.01
+    assert _flag(argv, "--max-weight-staleness") == "4"
+    assert _flag(argv, "--lr-decay-style") == "constant"
+    assert float(_flag(argv, "--lr-warmup-fraction")) == 0
+    argv = shlex.split(
+        launcher._train_args(
+            launcher.ScriptArgs(algorithm=algorithm, lr=2e-6, weight_decay=0.02, max_weight_staleness=7)
+        )
+    )
+    assert float(_flag(argv, "--lr")) == 2e-6
+    assert float(_flag(argv, "--weight-decay")) == 0.02
+    assert _flag(argv, "--max-weight-staleness") == "7"

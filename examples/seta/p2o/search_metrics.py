@@ -16,6 +16,9 @@ class SearchMetrics:
         self.step_key = self.prefix + "/event"
         self.training_step = training_step
         tracking.define_step_key_metric_group(self.prefix, self.step_key)
+        self.timing_prefix = self.prefix + "/timing"
+        self.timing_step_key = self.timing_prefix + "/event"
+        tracking.define_step_key_metric_group(self.timing_prefix, self.timing_step_key)
 
     def __call__(self, event):
         # Search.state is the transactional source of truth. JSONL is a convenient
@@ -27,6 +30,21 @@ class SearchMetrics:
         }
         metrics[self.prefix + "/training_step"] = self.training_step
         tracking.log(self.args, metrics, step_key=self.step_key)
+
+    def timing(self, event):
+        """Separate axis: phase timers continue after the last search event."""
+        stage = event["stage"]
+        tracking.log(
+            self.args,
+            {
+                self.timing_step_key: event["event"],
+                self.timing_prefix + f"/{stage}_seconds": event["seconds"],
+                self.timing_prefix + f"/{stage}_cumulative_seconds": event["cumulative_seconds"],
+                self.timing_prefix + "/training_step": self.training_step,
+                self.timing_prefix + "/failed": int(event["status"] != "completed"),
+            },
+            step_key=self.timing_step_key,
+        )
 
     def finish(self, state):
         # Plotting is an optional dependency of this example, imported only when

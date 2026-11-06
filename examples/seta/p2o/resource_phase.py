@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 
-from examples.seta.p2o.resource_specs import phase_specs
+from examples.seta.p2o.resource_specs import phase_specs, training_engine_config
 from examples.seta.p2o.resources import plan_gepa_placement
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, wait_server_healthy
 from miles.ray.specs.inference import compute_engine_pool_ids
@@ -33,9 +33,6 @@ class GepaResourcePhase:
         cycle_id,
         policy_checkpoint,
         reflection_checkpoint,
-        reflection_num_gpus=1,
-        reflection_tp=1,
-        policy_tp=1,
     ):
         if args.cluster_backend != "ray" or not args.offload_train or not args.starts_inference_engines:
             raise ValueError("GEPA phase requires native Ray engines and --offload-train")
@@ -46,9 +43,7 @@ class GepaResourcePhase:
         self.cycle_id = cycle_id
         self.policy_checkpoint = str(policy_checkpoint)
         self.reflection_checkpoint = str(reflection_checkpoint)
-        self.layout_options = dict(
-            reflection_num_gpus=reflection_num_gpus, reflection_tp=reflection_tp, policy_tp=policy_tp
-        )
+        self.engine_config = training_engine_config(args)
         self.pool_ids = []
         self.normal_cells = []
         self.endpoints = []
@@ -61,10 +56,11 @@ class GepaResourcePhase:
         if self.phase != "training":
             raise RuntimeError(f"Cannot enter GEPA from {self.phase}")
         slots = await self.manager.gpu_slots.remote("actor")
-        placements = plan_gepa_placement(slots, **self.layout_options)
+        placements = plan_gepa_placement(slots, rollout_gpus_per_engine=self.engine_config.num_gpus_per_engine)
         specs, engines = phase_specs(
             self.args,
             placements,
+            engine_config=self.engine_config,
             cycle_id=self.cycle_id,
             policy_checkpoint=self.policy_checkpoint,
             reflection_checkpoint=self.reflection_checkpoint,

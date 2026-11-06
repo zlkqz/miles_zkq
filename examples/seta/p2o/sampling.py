@@ -1,4 +1,4 @@
-"""Native sample identities, finite submission windows and random buffer selection."""
+"""Native sample identities, finite submission windows and quota-adjusted FIFO consumption."""
 
 import logging
 from collections import deque
@@ -148,10 +148,8 @@ class P2ODataBuffer(DefaultDataBuffer):
         infos = [first_sample(entry.group).metadata["p2o"] for entry in self._buffer]
         selected = select_training_batch(
             templated=[info["templated"] for info in infos],
-            priorities=[self.owner.priority(self.owner.task(entry.prompt_group[0])) for entry in self._buffer],
             size=num_groups,
             config=self.config,
-            rng=self.owner.rng,
         )
         entries = [self._buffer[i] for i in selected.indices]
         indices = set(selected.indices)
@@ -161,5 +159,5 @@ class P2ODataBuffer(DefaultDataBuffer):
         self.owner.metrics["consumption/tasks"] += num_groups
         if selected.fallback:
             self.owner.metrics[f"consumption/fallback/{selected.fallback}"] += 1
-        logger.info("P2O consume available=%d total=%d selection=%s", len(infos), num_groups, selected)
+        logger.info("P2O consume order=fifo available=%d total=%d selection=%s", len(infos), num_groups, selected)
         return entries

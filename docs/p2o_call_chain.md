@@ -1,6 +1,6 @@
 # P2O + SETA：调用链、异步取样与沙盒隔离
 
-核对日期：2026-11-05。本文描述当前工作区的实际实现，代码链接定位到本次核对的行号；函数名可用于代码变动后的检索。算法约定见 [主计划](../P2O_SETA_PLAN.md)，启动与恢复操作见 [使用说明](p2o_seta_usage.md)，此前GPU验收见 [实现记录](p2o_implementation_progress.md)。本次只读代码、已有日志和144服务配置，并运行CPU测试；未申请GPU、启动模型、重启服务或取消在线任务。
+核对日期：2026-11-05。本文描述当前工作区的实际实现，代码链接定位到本次核对的行号；函数名可用于代码变动后的检索。算法约定见 [主计划](../P2O_SETA_PLAN.md)，启动与恢复操作见 [使用说明](p2o_seta_usage.md)，此前GPU验收见 [实现记录](p2o_implementation_progress.md)。初次核对读取代码、已有日志和144服务配置；随后按用户要求修改共享默认值、GEPA引擎继承与耗时记录，并运行CPU测试；未申请GPU、启动模型、重启服务或取消在线任务。
 
 ## 1. 从启动脚本到一次参数更新
 
@@ -18,7 +18,7 @@ flowchart TD
     H --> I[144: 独立子进程、Harbor、Terminus-2、verifier]
     I --> J[session采集: tokens、动作mask、behavior logprob、reward]
     J --> K[难任务收集、完整组进入buffer]
-    K --> L[get: 陈旧度过滤、随机抽组、模板比例调整]
+    K --> L[get: 陈旧度过滤、FIFO取组、模板比例调整]
     L --> M[转换训练数据、按DP分片]
     M --> N[Megatron actor: 同一更新前模型双上下文打分]
     N --> O[GRPO优势、无模板forward、CRM、IcePop、PPO loss]
@@ -35,11 +35,11 @@ flowchart TD
 
 | 顺序 | 代码位置 | 作用 |
 | --- | --- | --- |
-| 1 | [my_scripts/run_seta.sh:107](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:107)；[my_scripts/run_seta.sh:275](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:275) | `SETA_ALGORITHM=p2o` 选择实验；生成实验名、保存路径、独立RUN_ID，写本次run记录，调用Python启动器。共享shell仍默认DAPO；GRPO/DAPO后缀脚本复用它。 |
-| 2 | [scripts/run_qwen3_8b_seta.py:199](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:199) | 组装数据、session v2、GRPO优势、PPO clip、IcePop、优化器、原生训推拓扑参数；DAPO额外启用同分过滤，GRPO/P2O不启用。 |
-| 3 | [scripts/run_qwen3_8b_seta.py:263](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:263)；[scripts/run_qwen3_8b_seta.py:132](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:132) | P2O选择专用薄入口，注册`P2ORolloutFn`、`P2ODataBuffer`、`score_contexts`三个扩展；GEPA参数实际传给相应消费者。 |
+| 1 | [my_scripts/run_seta.sh:109](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:109)；[my_scripts/run_seta.sh:277](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:277) | `SETA_ALGORITHM=p2o` 选择实验；生成实验名、保存路径、独立RUN_ID，写本次run记录，调用Python启动器。共享shell仍默认DAPO；GRPO/DAPO后缀脚本复用它。 |
+| 2 | [scripts/run_qwen3_8b_seta.py:198](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:198) | 组装数据、session v2、GRPO优势、PPO clip、IcePop、优化器、原生训推拓扑参数；DAPO额外启用同分过滤，GRPO/P2O不启用。 |
+| 3 | [scripts/run_qwen3_8b_seta.py:263](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:263)；[scripts/run_qwen3_8b_seta.py:131](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:131) | P2O选择专用薄入口，注册`P2ORolloutFn`、`P2ODataBuffer`、`score_contexts`三个扩展；GEPA参数实际传给相应消费者。 |
 | 4 | [scripts/run_qwen3_8b_seta.py:314](/ceph_home/zhangkaiqi2024/miles/scripts/run_qwen3_8b_seta.py:314)；[miles/utils/external_utils/command_utils/ray_backend/backend.py:29](/ceph_home/zhangkaiqi2024/miles/miles/utils/external_utils/command_utils/ray_backend/backend.py:29) | 使用原生command backend提交Ray job；`job_lifetime="launcher"`使启动器退出时停止对应job。正常卡数由既有布局配置决定。 |
-| 5 | [examples/seta/p2o/train.py:12](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/train.py:12)；[examples/seta/p2o/driver.py:83](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:83) | 先选模型/P2O配对checkpoint，再执行参数校验，调用原生`train_async.train(..., phase_factory=PhaseHandler)`，不是另写一个PPO训练器。 |
+| 5 | [examples/seta/p2o/train.py:12](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/train.py:12)；[examples/seta/p2o/driver.py:81](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:81) | 先选模型/P2O配对checkpoint，再执行参数校验，调用原生`train_async.train(..., phase_factory=PhaseHandler)`，不是另写一个PPO训练器。 |
 | 6 | [train_async.py:23](/ceph_home/zhangkaiqi2024/miles/train_async.py:23) | 创建worker manager、inference controller、rollout executor和actor，初始化并同步模型；P2O注入phase handler，训练更新仍走原生actor。 |
 
 共享脚本和Python字段均允许显式覆盖。不要只看Python的字段默认值推断实际run配置：shell会覆盖部分字段（例如保存频率），最终以日志中的生效参数为准。
@@ -55,7 +55,7 @@ flowchart TD
 7. [seta_miles_runtime/harbor/miles_agent_server.py:138](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/miles_agent_server.py:138) 登记run/session身份，等待服务全局semaphore；[seta_miles_runtime/harbor/agent_server/trial_runner.py:443](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/agent_server/trial_runner.py:443) 为每条episode启动独立进程，加载SETA runner。
 8. [examples/seta/harbor_trial.py:68](/ceph_home/zhangkaiqi2024/miles/examples/seta/harbor_trial.py:68) 构建任务环境、设置独立trial名称并运行Harbor；[examples/seta/terminus.py:22](/ceph_home/zhangkaiqi2024/miles/examples/seta/terminus.py:22) 将模板注入实际instruction，Terminus-2多轮读模型输出并执行工具，最后运行verifier。奖励保留 `passed/total + 0.2 × 全通过标志`。
 9. 模型请求、输出和实际behavior logprob记录在session内。agent结束或失败后，`agentic_tool_call.generate`仍尝试收集；[examples/seta/agent.py:76](/ceph_home/zhangkaiqi2024/miles/examples/seta/agent.py:76) 保留原生动作token归属，检查奖励有效性并验证双上下文。无效episode标为ABORTED，不能冒充训练零奖励。
-10. [examples/seta/p2o/rollout.py:156](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/rollout.py:156) 先观察完整组，按无bonus的progress收集难任务，再 `attach_training_context` 附加去模板所需的token前缀；结果交给buffer。Miles以完整episode/分支归属处理多轮数据，不把每个terminal turn当一个独立GRPO任务。
+10. [examples/seta/p2o/rollout.py:153](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/rollout.py:153) 先观察完整组，按无bonus的progress收集难任务，再 `attach_training_context` 附加去模板所需的token前缀；结果交给buffer。Miles以完整episode/分支归属处理多轮数据，不把每个terminal turn当一个独立GRPO任务。
 
 ### 1.4 从buffer到optimizer.step
 
@@ -83,16 +83,9 @@ CRM是二值保留mask，**不是把概率比裁剪到[0.01,10]后作为连续�
 
 ## 2. 陈旧度与取样顺序
 
-### 2.1 当前默认没有陈旧度淘汰上限
+### 2.1 SETA默认陈旧度上限为4
 
-[miles/utils/arguments.py:940](/ceph_home/zhangkaiqi2024/miles/miles/utils/arguments.py:940) 默认 `None`，当前共享shell与SETA Python启动器均未覆盖；因此**不会因为旧轨迹落后1、2或更多次更新而按年龄丢弃**。队列容量、生成并发和IcePop不能替代一个严格的年龄上限。
-
-若通过 `EXTRA_ARGS` 设置（下例仅说明配置方式，本次未修改默认）：
-
-```bash
-EXTRA_ARGS='--max-weight-staleness 2' \
-  WANDB_MODE=offline SETA_ALGORITHM=p2o bash my_scripts/run_seta.sh
-```
+原生Miles默认仍是None；SETA共享shell/Python启动器已对GRPO、DAPO、P2O统一显式设置 `max_weight_staleness=4`。覆盖方式见 [使用说明](p2o_seta_usage.md)。队列容量、生成并发和IcePop不能替代年龄过滤。
 
 其实际判定由 [miles/rollout/filter_hub/common_filters.py:37](/ceph_home/zhangkaiqi2024/miles/miles/rollout/filter_hub/common_filters.py:37) 和 [miles/rollout/fully_async_data_buffer.py:254](/ceph_home/zhangkaiqi2024/miles/miles/rollout/fully_async_data_buffer.py:254) 实现：
 
@@ -104,7 +97,7 @@ staleness = V - v_min
 丢弃整组：staleness > max_weight_staleness
 ```
 
-例如V=10、阈值2，最早生成token版本8仍可用，版本7则整组淘汰。多轮轨迹可跨版本生成，甚至in_place更新下单次生成跨版本；不是只看轨迹开始/结束时的一次版本，也不取平均版本来决定是否丢弃。只统计生成token，不计算prompt KV的年龄；缺可解析版本时年龄为None，本过滤器不据此丢弃。另有原生版本有效性检查，不应把“缺版本不按年龄过滤”当作允许任意无版本轨迹。
+例如V=10、阈值4，最早生成token版本6仍可用，版本5则整组淘汰。多轮轨迹可跨版本生成，甚至in_place更新下单次生成跨版本；不是只看轨迹开始/结束时的一次版本，也不取平均版本来决定是否丢弃。只统计生成token，不计算prompt KV的年龄；缺可解析版本时年龄为None，本过滤器不据此丢弃。另有原生版本有效性检查，不应把“缺版本不按年龄过滤”当作允许任意无版本轨迹。
 
 版本来自 [miles/backends/megatron_utils/model.py:663](/ceph_home/zhangkaiqi2024/miles/miles/backends/megatron_utils/model.py:663)：每次成功optimizer更新递增。默认 `update_weights_interval=1`，所以通常等于参数更新次数差。若更改发布间隔，一个rollout含多次optimizer更新，或某步跳过更新，不能再简单把它解释为“外层step编号差”；过滤参照的是**最近发布到引擎的版本**，不是尚未发布的trainer权重。
 
@@ -117,14 +110,16 @@ staleness = V - v_min
 1. **入池有效性**：`DefaultDataBuffer._preput_filter` 检查组内是否有ABORTED或缺reward；任一异常会影响整组。DAPO再过滤组内奖励方差近零；GRPO/P2O关闭该过滤。
 2. **消费时陈旧度**：每次get先扫描buffer并执行上述年龄过滤（如开启）。历史难任务、模板任务没有豁免权。
 3. **数量**：足够8个有效完整组才组batch；不足则等实际数据。P2O的GEPA收尾边界可中断这个等待，避免等一个不可能补齐的batch。
-4. **选择**：GRPO/DAPO用原生FIFO，按完成入池顺序取前8组；P2O的 [examples/seta/p2o/sampling.py:145](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/sampling.py:145) 调用 [examples/seta/p2o/mixing.py:40](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/mixing.py:40)，从可用池无放回随机选8组。
-5. **P2O混入调整**：目标2–4组有模板。随机结果在范围内直接用；少于2组时，优先用较新GEPA轮次的有模板组替换普通组；超过4组时，保留较新轮次的4组，用普通组替换其余。轮次相同先随机打散，不按奖励高低排序，也不按更年轻的policy版本额外排序。
-6. **可用池不足**：若整个池少于2个有模板组，或少于4个普通组，则原样返回最初随机结果，**不等待配额**。因此回退时可低于25%，也可高于50%；这是当前实现对“池无法满足就正常随机取”的具体解释。
-7. **移除已选组**：本次被消费的轨迹从buffer移除，不是永久经验池反复训练。其后按sample index排序只是整理已选结果，并不撤销前面的随机选择。
+4. **选择**：GRPO/DAPO用原生FIFO，按完成入池顺序取前8组；P2O的 [examples/seta/p2o/sampling.py:145](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/sampling.py:145) 调用 [examples/seta/p2o/mixing.py:40](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/mixing.py:40)，先按完成入池顺序选前8组。
+5. **P2O混入调整**：目标2–4组有模板。FIFO初选在范围内直接用；少于2组时，用后续最早入池的模板组替换初选中最晚入池的普通组；超过4组时，保留最早入池的4个模板组，用后续最早入池的普通组补齐。最后按入池顺序返回。消费不按GEPA轮次、奖励或policy版本重新排序，不消耗抽样RNG。
+6. **可用池不足**：若整个池少于2个有模板组，或少于4个普通组，则原样返回最初FIFO结果，**不等待配额**。因此回退时可低于25%，也可高于50%；这是当前实现对“池无法满足就正常取，不等待”与本次FIFO修订的具体解释。
+7. **移除已选组**：本次被消费的轨迹从buffer移除，不是永久经验池反复训练。因配额延后的组留在原队列位置。其后按sample index排序只是整理已选结果，不改变消费了哪些组。
 
 训练端看的是**生成时真实有无模板**，而不是当前难任务标签：旧的无模板轨迹不会在GEPA后被重新标记为带模板，也不会在取batch时补一段模板伪造behavior上下文。
 
-默认buffer容量为 `floor(2 × rollout_batch_size)=16`组；默认最大在途组数为8（128条episode），实际沙盒并发另受限。容量满时生产者背压；GEPA收尾为接收已有在途结果临时放宽容量。这些限制降低积压，但不保证最大年龄，特别是长轨迹或随机选中概率低的组。
+每次取的是8个完整group，每个group含同一次任务抽样的16条独立episode；不是从全池随机拼128条。P2O回放可使同一任务ID产生不同group，但不跨group凑16条。后续DP分片/动态microbatch可以拆分训练张量，不改变组内奖励/优势的归属。
+
+默认buffer容量为 `floor(2 × rollout_batch_size)=16`组；默认最大在途组数为8（128条episode），实际沙盒并发另受限。容量满时生产者背压；GEPA收尾为接收已有在途结果临时放宽容量。这些限制降低积压，但不保证最大年龄，特别是长轨迹或因配额暂时延后的组。
 
 ### 2.3 rollout提交窗口与训练消费不是同一次抽样
 
@@ -143,13 +138,13 @@ staleness = V - v_min
 | 顺序 | 代码位置 | 行为 |
 | --- | --- | --- |
 | 收集 | [examples/seta/p2o/coordinator.py:83](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/coordinator.py:83) → [examples/seta/p2o/hard_tasks.py:114](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/hard_tasks.py:114) | 自然组K条有效episode的无bonus progress均值不超过阈值则收集，任务身份去重；默认64个触发，threshold默认1/K。 |
-| 收尾 | [examples/seta/p2o/rollout.py:71](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/rollout.py:71) | trigger_pending后停止新提交，已有在途全部结束；buffer可容纳尾批。仍有完整训练batch时可先被消费；不足完整batch且边界ready才抛 `RolloutPhaseBoundary`。 |
-| driver切换 | [train_async.py:98](/ceph_home/zhangkaiqi2024/miles/train_async.py:98) → [examples/seta/p2o/driver.py:115](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:115) | 不与optimizer更新重叠；drain eval，freeze面板，保存pre_gepa模型/P2O配对状态。 |
+| 收尾 | [examples/seta/p2o/rollout.py:68](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/rollout.py:68) | trigger_pending后停止新提交，已有在途全部结束；buffer可容纳尾批。仍有完整训练batch时可先被消费；不足完整batch且边界ready才抛 `RolloutPhaseBoundary`。 |
+| driver切换 | [train_async.py:98](/ceph_home/zhangkaiqi2024/miles/train_async.py:98) → [examples/seta/p2o/driver.py:113](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:113) | 不与optimizer更新重叠；drain eval，freeze面板，保存pre_gepa模型/P2O配对状态。 |
 | 固定面板 | [examples/seta/p2o/hard_tasks.py:134](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/hard_tasks.py:134) | 保留收尾后的全部H>=64任务，随机固定16个dev及各4个seed；余下为search-train，整轮固定。 |
-| 资源转换 | [examples/seta/p2o/resource_phase.py:60](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_phase.py:60) → [examples/seta/p2o/resources.py:34](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resources.py:34) | 导出当前policy HF，offload训练actor，停止原推理cells，用本run已分配GPU创建GEPA推理资源；初始HF用于reflection，其余用于冻结的当前policy。GPU slot含node身份，不把多机的GPU0误当同一张卡。 |
-| 启动搜索 | [examples/seta/p2o/driver.py:143](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:143) → [examples/seta/p2o/search.py:198](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:198) | 构造runtime、事务状态和metrics，加载/恢复本轮搜索。 |
+| 资源转换 | [examples/seta/p2o/resource_phase.py:55](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_phase.py:55) → [examples/seta/p2o/resources.py:35](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resources.py:35) | 导出当前policy HF，offload训练actor，停止原推理cells，用本run已分配GPU创建GEPA推理资源；初始HF用于reflection，其余用于冻结的当前policy。GPU slot含node身份，不把多机的GPU0误当同一张卡。 |
+| 启动搜索 | [examples/seta/p2o/driver.py:148](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/driver.py:148) → [examples/seta/p2o/search.py:198](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:198) | 构造runtime、事务状态和metrics，加载/恢复本轮搜索。 |
 
-正常训练不是固定4+4；本机验收恰好4+4，GEPA为7+1。正式资源选择由原训练拓扑和reflection配置推导。初始模型是GEPA独立反思角色，不替换训练actor的old打分模型。
+正常训练不是固定4+4；此前本机验收恰好4+4、GEPA为7+1个单卡实例。当前正式资源按训练rollout engine配置切分，固定一个reflection实例，TP2的8卡示例为3+1个双卡实例。初始模型是GEPA独立反思角色，不替换训练actor的old打分模型。
 
 ### 3.2 异步探索与candidate准入
 
@@ -179,15 +174,15 @@ flowchart TD
 - [examples/seta/p2o/search.py:103](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:103) 在启动前持久化预算预留。C<=16时每个candidate最多一个在途探索，完成后可再次选择；C>16仅从 [examples/seta/p2o/search.py:33](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:33) 的前沿选父模板，可以同父并行。当前实现优先累计探索次数最少的可选父模板，再随机打破平局。
 - [examples/seta/p2o/search.py:134](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:134) 执行mini-before → reflect → mini-after → dev。默认mini3个任务，每任务一次；父/子复用任务与seed。无效mini轨迹可进入反思，mini均分中无效项按0计。
 - mini-after严格高于mini-before才做dev；dev不必超过best也允许进入candidate。**mini比较父子，早停比较全局best**，二者不要混为一谈。
-- [examples/seta/p2o/search_runtime.py:84](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:84) 为16个dev任务各运行4次；[examples/seta/p2o/scoring.py:114](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/scoring.py:114) 逐任务取有效结果均值，4次全无效记0，最终形成16维向量。候选标量分数是向量均值，Pareto直接比较向量。
+- [examples/seta/p2o/search_runtime.py:87](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:87) 为16个dev任务各运行4次；[examples/seta/p2o/scoring.py:114](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/scoring.py:114) 逐任务取有效结果均值，4次全无效记0，最终形成16维向量。候选标量分数是向量均值，Pareto直接比较向量。
 - [examples/seta/p2o/search.py:167](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:167) 按模板hash去重。重复文本不新增candidate；并发已发出的重复dev可能完成，其真实消耗仍记录。早停仅C>16开始，未刷新本轮best的探索终态累计（含无模板、mini拒绝等），刷新best清零。256预算按启动探索数，32 patience按这些终态计数，不要求它们成功到达dev。
 - 停止原因一旦锁存不被迟到改善撤销；停止新提交，已有探索仍完成并提交。因此最终候选可能在触发停止后继续增加。预算预留不超额，全部在途收尾后返回 `TemplateCycle`。
 
 ### 3.3 单次episode、反思沙盒及并发
 
-[examples/seta/p2o/search_runtime.py:137](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:137) 轮询选择policy或reflection的对应端点，先查持久化episode cache；未命中则创建session、调用同一个 `seta.agent.run`、取回完整session记录、原子保存结果、删除session。独立推理端点已标识模型路径和版本，不调用外置反思vLLM API。
+[examples/seta/p2o/search_runtime.py:142](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:142) 轮询选择policy或reflection的对应端点，先查持久化episode cache；未命中则创建session、调用同一个 `seta.agent.run`、取回完整session记录、原子保存结果、删除session。独立推理端点已标识模型路径和版本，不调用外置反思vLLM API。
 
-[examples/seta/p2o/search_runtime.py:119](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:119) → [examples/seta/p2o/reflection_files.py:69](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/reflection_files.py:69) → 同一HTTP `/run` → `harbor_trial._trial` 选择包内 `reflection_task` → [examples/seta/p2o/reflection_agent.py:35](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/reflection_agent.py:35) 。
+[examples/seta/p2o/search_runtime.py:123](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_runtime.py:123) → [examples/seta/p2o/reflection_files.py:69](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/reflection_files.py:69) → 同一HTTP `/run` → `harbor_trial._trial` 选择包内 `reflection_task` → [examples/seta/p2o/reflection_agent.py:35](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/reflection_agent.py:35) 。
 
 mini沙盒正常结束并回收，反思沙盒独立新建。证据包含实际初始messages/instruction、每轮动作/观察、评估result、feedback和原任务verifier脚本；缺失或无效轨迹保存已有材料与错误，不伪造输入。长轨迹反思副本去掉重复input_ids/logprobs数组，完整记录保留在本地episode cache。
 
@@ -199,9 +194,17 @@ mini沙盒正常结束并回收，反思沙盒独立新建。证据包含实际�
 
 搜索结束后，`PhaseHandler.run` 调用executor的 `rollout_phase("commit")`，由 [examples/seta/p2o/coordinator.py:126](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/coordinator.py:126) 校验面板并提交历史、保留所有H个任务的难身份与旧模板规则。没有有效新模板也是正常结束。
 
-`finally` 中 [examples/seta/p2o/resource_phase.py:151](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_phase.py:151) 移除GEPA pools、重启原推理cells、onload训练actor并同步权重；恢复失败则不继续训练。成功后保存post_gepa，再resume producer。[examples/seta/p2o/checkpoint.py:60](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/checkpoint.py:60) 原子发布模型与rollout配对指针；正常save_interval也使用同一保存路径。
+`finally` 中 [examples/seta/p2o/resource_phase.py:147](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_phase.py:147) 移除GEPA pools、重启原推理cells、onload训练actor并同步权重；恢复失败则不继续训练。成功后保存post_gepa，再resume producer。[examples/seta/p2o/checkpoint.py:60](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/checkpoint.py:60) 原子发布模型与rollout配对指针；正常save_interval也使用同一保存路径。
 
 搜索事务保存在 `SAVE/gepa/cycle_XXXXXX/search_state.json`；episode cache避免重做已持久化结果。进程死在外部结果落盘前仍可能重发请求，因此保证的是预算/候选逻辑提交幂等，不是网络请求恰好执行一次。[examples/seta/p2o/search.py:81](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search.py:81) 和 [examples/seta/p2o/search_metrics.py:10](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_metrics.py:10) 将阶段、候选/前沿数、best、patience、请求数、耗时等写入日志、W&B独立GEPA横轴及本地JSON/JSONL/PNG/SVG。
+
+### 3.5 当前引擎继承、耗时与恢复入口
+
+[resource_specs.training_engine_config](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_specs.py:14) 调用Miles原生配置解析器，选取训练policy的同质engine配方；[resources.plan_gepa_placement](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resources.py:35) 将本run全部已拥有GPU按此大小切分，最后一个实例分给初始reflection，其余给当前policy。[phase_specs](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/resource_specs.py:35)复制该配方并调用原生 `_compute_spec_inference_engine`，因此TP及SGLang设置与训练一致。支持范围和示例见 [使用说明](p2o_seta_usage.md)。
+
+`PhaseHandler.run` 和 `_run_phase` 负责整体/保存/资源切换计时；`SearchRuntime.minibatch/reflect/evaluate` 分别计前后mini、反思和dev的墙钟时间，交给 [GepaTimings.measure](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/timing.py:32) 持久化、[SearchMetrics.timing](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/search_metrics.py:34) 上传。阶段名称、边界和文件名以使用说明的“日志与指标”为准；这些是GEPA计时，不能用来回答CRM额外forward的训练开销。
+
+P2O恢复链是 `prepare_resume/select_paired_checkpoint` → `CheckpointLedger.latest` → 原生executor加载数据源与rollout状态 → [P2ORolloutFn.load](/ceph_home/zhangkaiqi2024/miles/examples/seta/p2o/rollout.py:184) → `SamplingCoordinator.load_state` → `TemplateHistory.restore`。历史原始dev/求解证据用于重建归一化概率，旧分配和抽样RNG随后恢复；当前搜索的事务/缓存由 `Search` 和 `SearchRuntime` 恢复。不会只加载模型而丢掉P2O历史。保存文件位置和旧scheduler语义见使用说明。
 
 ## 4. CRM额外old-logprob的耗时：已有数据与未验证内容
 
@@ -228,6 +231,8 @@ mini沙盒正常结束并回收，反思沙盒独立新建。证据包含实际�
 
 ### 5.1 正常任务创建与退出不会按服务名清掉另一训练的容器
 
+本次用户已说明GPU和Ray各自隔离；在此前提下，正常按run清理A不取消B。共享服务的 `/flush_all` 仍是全局操作，不能用于只清A。下面保留完整审计边界供排查。
+
 身份有四层，不应混用：
 
 | 身份 | 来源 | 用途 |
@@ -250,7 +255,7 @@ run_seta.sh 的 EXIT/INT/TERM trap
   -> _stop_agent_environment -> docker compose -p 该trial项目 down ...
 ```
 
-对应入口是 [my_scripts/run_seta.sh:230](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:230)、[my_scripts/stop_seta.py:34](/ceph_home/zhangkaiqi2024/miles/my_scripts/stop_seta.py:34)、[my_scripts/stop_seta.py:20](/ceph_home/zhangkaiqi2024/miles/my_scripts/stop_seta.py:20)、[seta_miles_runtime/harbor/miles_agent_server.py:315](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/miles_agent_server.py:315)、[seta_miles_runtime/harbor/src/harbor/trial/trial.py:346](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/trial/trial.py:346)、[seta_miles_runtime/harbor/src/harbor/trial/trial.py:1213](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/trial/trial.py:1213)、[seta_miles_runtime/harbor/src/harbor/environments/docker/docker.py:986](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/environments/docker/docker.py:986)。
+对应入口是 [my_scripts/run_seta.sh:232](/ceph_home/zhangkaiqi2024/miles/my_scripts/run_seta.sh:232)、[my_scripts/stop_seta.py:34](/ceph_home/zhangkaiqi2024/miles/my_scripts/stop_seta.py:34)、[my_scripts/stop_seta.py:20](/ceph_home/zhangkaiqi2024/miles/my_scripts/stop_seta.py:20)、[seta_miles_runtime/harbor/miles_agent_server.py:315](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/miles_agent_server.py:315)、[seta_miles_runtime/harbor/src/harbor/trial/trial.py:346](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/trial/trial.py:346)、[seta_miles_runtime/harbor/src/harbor/trial/trial.py:1213](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/trial/trial.py:1213)、[seta_miles_runtime/harbor/src/harbor/environments/docker/docker.py:986](/ceph_home/zhangkaiqi2024/miles/seta_miles_runtime/harbor/src/harbor/environments/docker/docker.py:986)。
 
 服务端在等待全局额度前已将请求登记到run_tasks，因此A排队中的请求也可按A的run_id取消。`/flush`返回“已发出取消”的数量，**不代表所有Docker容器已同步删除完毕**。子进程有120秒正常取消收尾窗口，超时才SIGKILL该子进程组。
 
@@ -285,4 +290,6 @@ run_seta.sh 的 EXIT/INT/TERM trap
 - CPU回归：`tests/fast/rollout/test_fully_async_data_buffer.py`、`tests/fast/p2o/test_sampling.py`、`tests/fast/p2o/test_mixing.py`，**196 passed，28 warnings**；设置 `CUDA_VISIBLE_DEVICES=''`、HF离线，未运行模型。
 - [run隔离检查脚本](../seta_miles_runtime/diagnostics/p2o_call_chain_20261105/check_run_isolation.py) 调用真实flush handler，以两个asyncio等待任务模拟A/B；验证取消A不取消B、未知run不取消任何任务、重复取消计数为0。[结果](../seta_miles_runtime/diagnostics/p2o_call_chain_20261105/run_isolation_audit.json)。这是CPU控制流检查，不是两组真实训练并发压力测试。
 - 只读比对144上的server、trial_runner、remote_images与本地SHA256一致；harbor_trial只有import顺序和换行差异。只读取明确列出的prune/heartbeat配置，没有修改服务环境。
-- CRM时间从已有日志解析，保留来源行号；未做新的profiling，也未据此更改模型、采样或默认陈旧度设置。
+- CRM时间从已有日志解析，保留来源行号；未做新的profiling。后续默认陈旧度等调整来自用户的明确要求，与该耗时估计无关。
+
+后续实现更新的CPU联合回归为 **1206 passed**，包含共享参数、GEPA配置继承、阶段计时和跨轮恢复；日志见 [final_cpu.log](../seta_miles_runtime/diagnostics/p2o_updates_20261105/final_cpu.log)，分组证据见实现记录末节。

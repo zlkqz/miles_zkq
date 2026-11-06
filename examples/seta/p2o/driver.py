@@ -8,11 +8,13 @@ from pathlib import Path
 from examples.seta.p2o.checkpoint import CheckpointLedger, atomic_json
 from examples.seta.p2o.hard_tasks import CyclePanel
 from examples.seta.p2o.resource_phase import GepaResourcePhase
+from examples.seta.p2o.resource_specs import training_engine_config
 from examples.seta.p2o.resources import plan_gepa_placement
 from examples.seta.p2o.scoring import CollectionConfig
 from examples.seta.p2o.search import Search, SearchConfig
 from examples.seta.p2o.search_metrics import SearchMetrics
 from examples.seta.p2o.search_runtime import SearchRuntime
+from examples.seta.p2o.timing import GepaTimings
 from miles.ray.placement_group import update_weights
 from miles.utils.processing_utils import load_tokenizer
 
@@ -67,12 +69,8 @@ def prepare_resume(args):
         )
         for i in range(total)
     ]
-    plan_gepa_placement(
-        slots,
-        reflection_num_gpus=args.gepa_reflection_num_gpus,
-        reflection_tp=args.gepa_reflection_tp,
-        policy_tp=args.gepa_policy_tp,
-    )
+    engine_config = training_engine_config(args)
+    plan_gepa_placement(slots, rollout_gpus_per_engine=engine_config.num_gpus_per_engine)
     # Fail before GPU allocation if local plot export is unavailable.
     from matplotlib.figure import Figure
 
@@ -117,8 +115,17 @@ class PhaseHandler:
         directory = Path(self.args.save) / "gepa" / f"cycle_{panel.cycle_id:06d}"
         directory.mkdir(parents=True, exist_ok=True)
         atomic_json(directory / "panel.json", panel.model_dump(mode="json"))
-        await self.save(step, cycle_id=panel.cycle_id, phase="pre_gepa")
         metrics = SearchMetrics(args=self.args, directory=directory, cycle_id=panel.cycle_id, training_step=step)
+        timings = GepaTimings(directory, emit=metrics.timing)
+        try:
+            with timings.measure("phase_total", training_step=step):
+                await self._run_phase(step, panel, directory, metrics, timings)
+        finally:
+            timings.plot()
+
+    async def _run_phase(self, step, panel, directory, metrics, timings):
+        with timings.measure("pre_checkpoint"):
+            await self.save(step, cycle_id=panel.cycle_id, phase="pre_gepa")
 
         async def sync():
             await update_weights(self.args, self.actor, self.executor, self.inference, rollout_id=step)
@@ -132,13 +139,11 @@ class PhaseHandler:
             cycle_id=panel.cycle_id,
             policy_checkpoint=directory / "policy_hf",
             reflection_checkpoint=self.args.hf_checkpoint,
-            reflection_num_gpus=self.args.gepa_reflection_num_gpus,
-            reflection_tp=self.args.gepa_reflection_tp,
-            policy_tp=self.args.gepa_policy_tp,
         )
         search = None
         try:
-            endpoints = await resources.enter(step)
+            with timings.measure("resource_enter"):
+                endpoints = await resources.enter(step)
             atomic_json(directory / "resources.json", endpoints)
             runtime = SearchRuntime(
                 args=self.args,
@@ -147,6 +152,7 @@ class PhaseHandler:
                 directory=directory,
                 config=self.config,
                 tokenizer=self.tokenizer,
+                timings=timings,
             )
             search = Search(
                 panel=panel,
@@ -157,14 +163,17 @@ class PhaseHandler:
                 seed=self.args.rollout_seed + panel.cycle_id,
                 emit=metrics,
             )
-            cycle = await search.run()
+            with timings.measure("search_total"):
+                cycle = await search.run()
             atomic_json(directory / "templates.json", cycle.model_dump(mode="json"))
             await self.executor.rollout_phase("commit", cycle.model_dump(mode="json"))
         finally:
             # No producer admission, post snapshot, or training if restore fails.
-            await resources.restore()
+            with timings.measure("resource_restore"):
+                await resources.restore()
             if search is not None:
                 metrics.finish(search.state)
-        await self.save(step, cycle_id=panel.cycle_id, phase="post_gepa")
+        with timings.measure("post_checkpoint"):
+            await self.save(step, cycle_id=panel.cycle_id, phase="post_gepa")
         await self.executor.rollout_phase("resume")
         logger.info("P2O GEPA cycle=%d committed; resumed native training at step=%d", panel.cycle_id, step + 1)

@@ -469,3 +469,36 @@ G2已完成独立模块验收，用户随后确认进入G3。G2没有提前实�
 验收脚本 `launch_smoke.py` 调用正式入口，调试使用3个真实任务、batch2×K2、trigger3/dev1×4/mini2/budget1、policy最多3轮、reflection最多8轮。参数仅作用于独立诊断进程；正式默认值未改变。实际验证包括正常训练资源 → 全推理资源（7+1）→ 原训练资源恢复、初始reflection和训练后policy的权重差异、模板后续训练以及保存恢复。最后的资源、scheduler和历史分配审计由 `audit.py` 聚合，可重复执行。
 
 验收边界：只实测单物理节点8卡；多节点GPU规划与非法布局经过单元测试，未实测跨机NCCL。搜索中途事务恢复经过单元测试，实际进程重启覆盖pre-GEPA和周期checkpoint。短预算反思质量有波动，两轮结果只证明功能路径可以运行，不是P2O效果结论；正式规模64任务、16维dev和并发16未做长时间效果实验。未因本轮验收更新CUDA、GPU或沙盒系统环境。
+
+
+### 2026-11-05：统一训练参数、GEPA引擎继承与阶段计时
+
+本次按用户追加要求完成；不占用GPU、不启动训练、不修改144服务或环境。正式用法统一维护在 [使用说明](p2o_seta_usage.md)，调用链及共享沙盒清理边界见 [调用链](p2o_call_chain.md)。
+
+- GRPO/DAPO/P2O共享入口默认更新为staleness=4、LR=1e-6、constant且warmup=0、weight decay=0.01；显式覆盖仍可用。启动命令快照只出现上述预期差异。续训旧P2O断点仍遵循原生保存的optimizer/scheduler参数，新默认值不静默改写旧实验。
+- GEPA取消独立reflection卡数/TP及policy TP参数。通过原生resolve_sglang_config读取训练同质engine配方（包含YAML overrides），phase_specs继承并调用原生engine spec/launcher，只覆盖模型路径、放置位置和显存生命周期。反思固定一个实例；其余本run GPU用相同TP组成policy实例。CPU覆盖单/双节点TP1/2/4/8、节点身份、非法布局、异质/PD拒绝、启动失败和资源恢复。当前不支持单个TP实例跨节点；未重新做GPU/NCCL验证。
+- 新增GepaTimings持久化阶段墙钟时间。整体、前后checkpoint、切入/恢复资源、完整搜索、bootstrap dev、mini前/后、反思、候选dev均记录原始区间、累计值、成功/失败/中断状态，导出JSON/JSONL/PNG/SVG并写log和W&B独立timing事件轴。CPU验证异步完成乱序、重叠时长、失败、中断恢复和W&B字段/本地值一致；未验证线上上传，需有效W&B凭据。
+- 新增跨轮checkpoint测试：两轮有模板、一轮无新模板，再收集下一轮难任务；保存/加载后原始历史、归一化概率、难任务优先级、旧分配、RNG、buffer、重试及预取/延后窗口一致，后续24次提交抽样一致。原有真实G10恢复证据仍保留，不以本次CPU测试替代真实GPU验收。
+- 新增8组×16episode取样测试：按完整group保留，组内任一episode版本落后5次淘汰整组、落后4次保留。GRPO/DAPO原生FIFO、P2O随机完整组加混入调整，未更改基线取样顺序。
+
+本次诊断目录：`seta_miles_runtime/diagnostics/p2o_updates_20261105/`。分组测试有重叠，不累加作为独立总数：
+
+| 测试范围 | 结果 | 日志 |
+| --- | --- | --- |
+| 共享默认值与SETA启动器 | 68 passed | `defaults.log` |
+| GEPA拓扑继承、phase driver和启动器 | 99 passed | `topology.log` |
+| 阶段计时、driver与搜索 | 23 passed | `timing.log` |
+| 跨轮恢复、完整组边界与计时 | 33 passed | `restore_groups.log` |
+| SETA启动器快照更新并核对差异 | 4 passed | `snapshot_retry.log` |
+| 全部启动器 + 全P2O + 原生异步buffer/rollout | **1206 passed，178 warnings，62.60s** | `final_cpu.log` |
+
+快照首次执行使用无home的容器UID，PyTorch导入尝试创建`/.cache`而失败（`snapshot.log`）；改用该容器现有测试用户/缓存后通过，未修改系统环境。Black/isort格式化、shell语法及git diff空白检查通过。本次没有新的CRM耗时profiling，也没有在线W&B上传成功的结论。
+
+
+### 2026-11-05：P2O训练消费对齐FIFO
+
+用户进一步修订训练batch取样顺序：先执行原生陈旧度过滤，再以完成入池顺序FIFO取完整组。配额满足时直接使用前B组；模板不足时补最早入池的模板组、延后最晚入池的普通组；超上限时保留最早模板组并补最早普通组。可用池不能满足配额则直接返回FIFO前B组，不新增配额等待。延后组保留原队列相对位置，消费不再按GEPA轮次排序或消耗RNG。rollout提交侧的自然采样、最近GEPA优先级和模板抽样保持原逻辑。此修订取代上一节中“P2O随机完整组”的描述。
+
+- 测试覆盖不同异步完成顺序、配额两端、FIFO回退、完整组、age=4/5边界、延后队列及checkpoint恢复、消费不推进模板抽样RNG。
+- 独立枚举8组池的全部256种模板分布，与所有合法4组子集的最早FIFO解比较。
+- 全P2O及原生异步buffer/rollout回归：**535 passed，28 warnings，9.95s**，日志 [fifo_cpu.log](../seta_miles_runtime/diagnostics/p2o_updates_20261105/fifo_cpu.log)。未运行GPU训练；格式和git diff空白检查通过。

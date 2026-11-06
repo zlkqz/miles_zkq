@@ -18,6 +18,7 @@ from examples.seta.p2o.history import TemplateEvaluation
 from examples.seta.p2o.reflection_files import build_bundle
 from examples.seta.p2o.scoring import aggregate_dev
 from examples.seta.p2o.templates import Template
+from examples.seta.p2o.timing import GepaTimings
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,10 @@ async def gather_episodes(coroutines):
 
 
 class SearchRuntime:
-    def __init__(self, *, args, panel, endpoints, directory, config, tokenizer):
+    def __init__(self, *, args, panel, endpoints, directory, config, tokenizer, timings=None):
         self.args, self.panel, self.config, self.tokenizer = args, panel, config, tokenizer
         self.directory = Path(directory)
+        self.timings = timings if timings is not None else GepaTimings(directory)
         self.policy = [e for e in endpoints if e["role"] == "policy"]
         self.reflection = [e for e in endpoints if e["role"] == "reflection"]
         if not self.policy or not self.reflection:
@@ -76,23 +78,25 @@ class SearchRuntime:
         return fmean(e.reward if e.valid else 0.0 for e in scores)
 
     async def minibatch(self, text, tasks, seeds, exploration, stage):
-        return await gather_episodes(
-            self._episode(task, seed, text, f"exploration_{exploration}/{stage}_{i}", export=True)
-            for i, (task, seed) in enumerate(zip(tasks, seeds, strict=True))
-        )
+        with self.timings.measure("minibatch_" + stage, exploration=exploration):
+            return await gather_episodes(
+                self._episode(task, seed, text, f"exploration_{exploration}/{stage}_{i}", export=True)
+                for i, (task, seed) in enumerate(zip(tasks, seeds, strict=True))
+            )
 
     async def evaluate(self, text, key):
-        episodes = await gather_episodes(
-            self._episode(plan.task, seed, text, f"{key}/dev_{i}_{j}")
-            for i, plan in enumerate(self.panel.dev)
-            for j, seed in enumerate(plan.seeds)
-        )
-        scores = aggregate_dev(
-            [p.task for p in self.panel.dev],
-            [self.evidence(e) for e in episodes],
-            expected_repeats=len(self.panel.dev[0].seeds),
-        )
-        return TemplateEvaluation(text=text, scores=scores, policy_version=self.version)
+        with self.timings.measure("bootstrap_dev" if key == "bootstrap" else "dev", key=key):
+            episodes = await gather_episodes(
+                self._episode(plan.task, seed, text, f"{key}/dev_{i}_{j}")
+                for i, plan in enumerate(self.panel.dev)
+                for j, seed in enumerate(plan.seeds)
+            )
+            scores = aggregate_dev(
+                [p.task for p in self.panel.dev],
+                [self.evidence(e) for e in episodes],
+                expected_repeats=len(self.panel.dev[0].seeds),
+            )
+            return TemplateEvaluation(text=text, scores=scores, policy_version=self.version)
 
     async def _episode(self, task, seed, text, key, export=False):
         metadata = dict(
@@ -117,22 +121,23 @@ class SearchRuntime:
         )
 
     async def reflect(self, parent, episodes, exploration):
-        bundle = build_bundle(parent, episodes)
-        key = f"exploration_{exploration}/reflection"
-        identity = dict(
-            bundle_hash=hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest(),
-            checkpoint=self.reflection[0]["checkpoint"],
-            turns=self.config.reflection_max_turns,
-        )
-        metadata = dict(
-            instance_id="p2o-reflection",
-            agent_name="terminus-2",
-            max_seq_len=self.args.max_seq_len,
-            p2o_reflection=bundle,
-            p2o_reflection_max_turns=self.config.reflection_max_turns,
-        )
-        raw = await self._cached_request(key, "reflection", identity, metadata, exploration)
-        return raw["result"].get("p2o_proposal") or ""
+        with self.timings.measure("reflection", exploration=exploration):
+            bundle = build_bundle(parent, episodes)
+            key = f"exploration_{exploration}/reflection"
+            identity = dict(
+                bundle_hash=hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest(),
+                checkpoint=self.reflection[0]["checkpoint"],
+                turns=self.config.reflection_max_turns,
+            )
+            metadata = dict(
+                instance_id="p2o-reflection",
+                agent_name="terminus-2",
+                max_seq_len=self.args.max_seq_len,
+                p2o_reflection=bundle,
+                p2o_reflection_max_turns=self.config.reflection_max_turns,
+            )
+            raw = await self._cached_request(key, "reflection", identity, metadata, exploration)
+            return raw["result"].get("p2o_proposal") or ""
 
     async def _cached_request(self, key, role, identity, metadata, seed):
         path = self.directory / "episodes" / f"{key}.json"

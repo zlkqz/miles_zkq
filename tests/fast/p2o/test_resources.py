@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from examples.seta.p2o import resource_phase
+from examples.seta.p2o.resource_specs import training_engine_config
 from examples.seta.p2o.resources import GpuSlot, plan_gepa_placement
 
 from miles.utils.workers.naming import compute_cell_id
@@ -20,45 +21,37 @@ def _slots(nodes=1, per_node=8):
     )
 
 
-@pytest.mark.parametrize("nodes,reflection,tp,expected", [(1, 1, 1, 8), (2, 1, 1, 16), (2, 2, 2, 15), (2, 4, 2, 14)])
-def test_all_owned_devices_are_used_once_with_node_local_tp(nodes, reflection, tp, expected):
+@pytest.mark.parametrize("nodes,tp,expected", [(1, 1, 8), (1, 2, 4), (2, 2, 8), (2, 4, 4), (2, 8, 2)])
+def test_all_owned_devices_are_used_once_with_node_local_tp(nodes, tp, expected):
     slots = _slots(nodes)
-    plan = plan_gepa_placement(slots, reflection_num_gpus=reflection, reflection_tp=tp)
+    plan = plan_gepa_placement(slots, rollout_gpus_per_engine=tp)
     assert len(plan) == expected
     assert tuple(d for engine in plan for d in engine.devices) == slots
-    assert sum(p.tp for p in plan if p.role == "reflection") == reflection
+    assert sum(p.role == "reflection" for p in plan) == 1
+    assert all(p.tp == tp for p in plan)
     assert all(len({d.node_id for d in engine.devices}) == 1 for engine in plan)
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        dict(reflection_num_gpus=0),
-        dict(reflection_num_gpus=8),
-        dict(reflection_num_gpus=3, reflection_tp=2),
-        dict(policy_tp=2),
-        dict(policy_tp=True),
-    ],
-)
-def test_invalid_layouts_are_not_silently_shrunk(kwargs):
+@pytest.mark.parametrize("tp", [0, 8, 3, True, 16])
+def test_invalid_layouts_are_not_silently_shrunk(tp):
     with pytest.raises(ValueError):
-        plan_gepa_placement(_slots(), **kwargs)
+        plan_gepa_placement(_slots(), rollout_gpus_per_engine=tp)
 
 
 def test_distinct_node_gpu_zero_is_valid_but_duplicate_physical_device_is_not():
     slots = _slots(2)
-    assert len(plan_gepa_placement(slots)) == 16
+    assert len(plan_gepa_placement(slots, rollout_gpus_per_engine=1)) == 16
     bad = list(slots)
     bad[1] = replace(bad[1], physical_gpu_id=0)
     with pytest.raises(ValueError, match="Duplicate"):
-        plan_gepa_placement(bad)
+        plan_gepa_placement(bad, rollout_gpus_per_engine=1)
 
 
 def test_noncontiguous_physical_devices_refuse_tp_but_allow_single_gpu_engines():
     slots = tuple(replace(d, physical_gpu_id=d.physical_gpu_id * 2) for d in _slots())
-    assert len(plan_gepa_placement(slots)) == 8
+    assert len(plan_gepa_placement(slots, rollout_gpus_per_engine=1)) == 8
     with pytest.raises(ValueError, match="contiguous"):
-        plan_gepa_placement(slots, reflection_num_gpus=2, reflection_tp=2)
+        plan_gepa_placement(slots, rollout_gpus_per_engine=2)
 
 
 @pytest.fixture
@@ -92,7 +85,9 @@ def phase(monkeypatch, tmp_path):
     monkeypatch.setattr(
         resource_phase, "phase_specs", lambda *a, **k: ([SimpleNamespace(name="temp")], [{"role": "policy"}])
     )
-    args = SimpleNamespace(
+    from tests.fast.ray.rollout.conftest import make_args
+
+    args = make_args(
         cluster_backend="ray",
         offload_train=True,
         starts_inference_engines=True,
@@ -213,7 +208,8 @@ def test_phase_specs_preserve_launch_args_and_use_owned_slots():
     before = vars(args).copy()
     specs, engines = phase_specs(
         args,
-        plan_gepa_placement(_slots(2)),
+        plan_gepa_placement(_slots(2), rollout_gpus_per_engine=1),
+        engine_config=training_engine_config(args),
         cycle_id=3,
         policy_checkpoint="/policy",
         reflection_checkpoint="/initial",
@@ -289,3 +285,87 @@ async def test_partial_offload_failure_attempts_onload_without_restarting_engine
         await obj.enter(0)
     assert obj.phase == "training"
     assert events == ["gpu_slots", "get_cell_infos", "export_hf", "onload"]
+
+
+def test_gepa_inherits_yaml_recipe_and_cli_engine_settings(monkeypatch):
+    from examples.seta.p2o import resource_specs
+    from tests.fast.ray.rollout.conftest import make_args
+
+    from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
+
+    recipe = ServerGroupConfig(
+        worker_type="regular",
+        num_gpus=4,
+        num_gpus_per_engine=2,
+        gpu_offset=0,
+        engine_offset=0,
+        overrides={
+            "model_path": "/initial",
+            "mem_fraction_static": 0.57,
+            "attention_backend": "triton",
+            "disable_cuda_graph": True,
+        },
+        needs_offload=False,
+    )
+    config = SglangConfig(
+        models=[ModelConfig(name="actor", model_path="/initial", server_groups=[recipe], update_weights=True)]
+    )
+    monkeypatch.setattr(resource_specs, "resolve_sglang_config", lambda _: config)
+    args = make_args(
+        rollout_num_gpus_per_engine=1, sglang_context_length=8192, sglang_dp_size=1, sglang_ep_size=1, sglang_pp_size=1
+    )
+    inherited = training_engine_config(args)
+    assert inherited.num_gpus_per_engine == 2  # YAML wins over the global fallback.
+    captured = []
+    original = resource_specs._compute_spec_inference_engine
+
+    def capture(phase_args, index, group_index, model, group):
+        captured.append((phase_args, group))
+        return original(phase_args, index, group_index, model, group)
+
+    monkeypatch.setattr(resource_specs, "_compute_spec_inference_engine", capture)
+    _, engines = resource_specs.phase_specs(
+        args,
+        plan_gepa_placement(_slots(2), rollout_gpus_per_engine=2),
+        engine_config=inherited,
+        cycle_id=1,
+        policy_checkpoint="/current",
+        reflection_checkpoint="/initial",
+    )
+    assert len(engines) == 8 and sum(e["role"] == "reflection" for e in engines) == 1
+    for phase_args, group in captured:
+        assert phase_args.sglang_context_length == 8192
+        assert group.num_gpus_per_engine == 2
+        assert group.overrides["mem_fraction_static"] == 0.57
+        assert group.overrides["attention_backend"] == "triton"
+        assert group.overrides["disable_cuda_graph"] is True
+        assert group.overrides["enable_memory_saver"] is False
+    assert captured[-1][1].model_path == "/initial"
+    assert all(group.model_path == "/current" for _, group in captured[:-1])
+    assert "enable_memory_saver" not in recipe.overrides
+
+
+@pytest.mark.parametrize(
+    "change", [{"num_gpus_per_engine": 2}, {"overrides": {"model_path": "/x"}}, {"worker_type": "prefill"}]
+)
+def test_ambiguous_engine_recipes_are_rejected_before_start(monkeypatch, change):
+    from examples.seta.p2o import resource_specs
+
+    from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
+
+    first = ServerGroupConfig(
+        worker_type="regular",
+        num_gpus=2,
+        num_gpus_per_engine=1,
+        gpu_offset=0,
+        engine_offset=0,
+        overrides={"model_path": "/initial"},
+        needs_offload=False,
+    )
+    second = first.model_copy(update=change)
+    config = SglangConfig(
+        models=[ModelConfig(name="actor", model_path="/initial", server_groups=[first, second], update_weights=True)]
+    )
+    monkeypatch.setattr(resource_specs, "resolve_sglang_config", lambda _: config)
+    with pytest.raises(ValueError, match="homogeneous|regular"):
+        training_engine_config(None)

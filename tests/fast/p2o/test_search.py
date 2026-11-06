@@ -250,7 +250,8 @@ def test_local_metrics_and_custom_wandb_axis(tmp_path, monkeypatch):
     reporter(event)
     reporter.finish({"events": [event]})
     assert events[0] == ("gepa/cycle_2", "gepa/cycle_2/event")
-    assert events[1]["step_key"] == "gepa/cycle_2/event"
+    assert events[1] == ("gepa/cycle_2/timing", "gepa/cycle_2/timing/event")
+    assert events[2]["step_key"] == "gepa/cycle_2/event"
     assert json.loads((tmp_path / "metrics.json").read_text()) == [event]
     assert (tmp_path / "metrics.png").stat().st_size > 1000 and (tmp_path / "metrics.svg").exists()
 

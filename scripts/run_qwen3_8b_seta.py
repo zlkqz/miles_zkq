@@ -14,7 +14,7 @@ Args:
   --train-num-gpus / --infer-num-gpus: 异步训练/推理的集群总卡数；0 表示自动分配。
   --algorithm: grpo 关闭同分过滤；dapo 开启（默认）；p2o 在 GRPO 上启用难任务/CRM/GEPA。
   --gepa-trigger-unique-hard-tasks / --gepa-budget: GEPA 难任务触发门槛与探索预算。
-  --gepa-reflection-num-gpus / --gepa-reflection-tp: GEPA 期间初始反思模型的 GPU 数与 TP。
+  GEPA policy/reflection 均继承训练 rollout engine 的 GPU 数、TP 和 SGLang 配置；反思固定一个实例。
   --num-rollout: 非零时覆盖 --num-epoch；小规模验证应使用该参数。
 
 示例：python scripts/run_qwen3_8b_seta.py --mode plan
@@ -76,9 +76,6 @@ class ScriptArgs(U.ExecuteTrainConfig):
     gepa_minibatch: int = _SEARCH_DEFAULTS.minibatch
     gepa_reflection_max_turns: int = _SEARCH_DEFAULTS.reflection_max_turns
     gepa_max_template_tokens: int = _SEARCH_DEFAULTS.max_template_tokens
-    gepa_reflection_num_gpus: int = 1
-    gepa_reflection_tp: int = 1
-    gepa_policy_tp: int = 1
     training_mode: Literal["async", "sync"] = "async"
     train_num_gpus: int = 0
     infer_num_gpus: int = 0
@@ -100,7 +97,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     record_terminal_session: bool = False
     full_pass_bonus: float = 0.2
     save_interval: int = 50
-    lr: float = 1.7e-5
+    lr: float = 1e-6
+    weight_decay: float = 0.01
+    max_weight_staleness: int = 4
     session_server_port: int = 30000
     session_server_workers: int = 8
     sglang_context_length: int = 32768
@@ -206,6 +205,7 @@ def _train_args(args: ScriptArgs) -> str:
         f"--prompt-data {shlex.quote(args.data_dir + '/train.jsonl')} --input-key prompt --metadata-key metadata "
         f"{count}--rollout-shuffle --rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} --global-batch-size {args.global_batch_size} "
+        f"--max-weight-staleness {args.max_weight_staleness} "
         f"--rollout-max-response-len {args.max_response_len} --max-seq-len {args.max_seq_len} "
         "--rollout-temperature 1 --rollout-top-p 1 --balance-data "
         "--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate "
@@ -236,7 +236,7 @@ def _train_args(args: ScriptArgs) -> str:
         "--kl-coef 0 --kl-loss-coef 0 --entropy-coef 0 --use-tis "
         "--custom-tis-function-path miles.backends.training_utils.loss.hub.corrections.icepop_function "
     )
-    optimizer = f"--optimizer adam --lr {args.lr} --lr-decay-style constant --lr-warmup-fraction 0.001 --weight-decay 0.017 --adam-beta1 0.9 --adam-beta2 0.999 --adam-eps 1e-8 --clip-grad 1 "
+    optimizer = f"--optimizer adam --lr {args.lr} --lr-decay-style constant --lr-warmup-fraction 0 --weight-decay {args.weight_decay} --adam-beta1 0.9 --adam-beta2 0.999 --adam-eps 1e-8 --clip-grad 1 "
     sglang = f"--rollout-num-gpus-per-engine {args.rollout_gpus_per_engine} --sglang-mem-fraction-static {args.mem_fraction} --sglang-attention-backend triton --sglang-context-length {args.sglang_context_length} --sglang-router-port {args.router_port} "
     misc = (
         "--seed 1 --bf16 --attention-dropout 0 --hidden-dropout 0 "

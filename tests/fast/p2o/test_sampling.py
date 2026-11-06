@@ -5,16 +5,16 @@ from argparse import Namespace
 from collections import deque
 
 import pytest
-
 from examples.seta.p2o.coordinator import CoordinatorState, SamplingCoordinator
 from examples.seta.p2o.evidence import EpisodeEvidence, Origin, TaskObservation
 from examples.seta.p2o.history import TemplateCycle, TemplateEvaluation
 from examples.seta.p2o.mixing import MixConfig
 from examples.seta.p2o.sampling import P2ODataBuffer, SubmissionWindows
 from examples.seta.p2o.scoring import CollectionConfig, aggregate_dev
+
 from miles.rollout.data_source import RolloutDataSource
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, first_sample
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 class Catalog:
@@ -241,11 +241,38 @@ async def test_buffer_out_of_order_completion_keeps_all_groups_and_actual_templa
     for entry in shuffled:
         await replay.put(entry)
     before = copy.deepcopy([e.group[0].metadata for e in entries])
+    rng_before = owner.rng.getstate()
     left = await asyncio.wait_for(replay.get(num_groups=8), timeout=1)
     right = await asyncio.wait_for(replay.get(num_groups=8), timeout=1)
     assert 2 <= sum(first_sample(e.group).metadata["p2o"]["templated"] for e in left) <= 4
     assert {id(e) for e in left + right} == {id(e) for e in entries} and not replay._buffer
     assert before == [e.group[0].metadata for e in entries]
+    assert owner.rng.getstate() == rng_before
+
+
+async def test_buffer_fifo_uses_completion_order_and_preserves_deferred_entries_on_restore():
+    data = source()
+    owner = coordinator(data)
+    finish_cycle(owner, [0, 1, 2, 3])
+    replay = buffer(owner)
+    # Prompt identity/index order is deliberately different from completion order.
+    order = [15, 14, 0, 13, 12, 11, 10, 9, 3, 2, 1, 8]
+    entries = [completed(data, owner, i, templated=i < 4) for i in range(16)]
+    for i in order:
+        await replay.put(entries[i])
+    chosen = await replay.get(num_groups=8)
+    assert [entry.group[0].metadata["instance_id"] for entry in chosen] == [
+        f"task_{i}" for i in [15, 14, 0, 13, 12, 11, 10, 3]
+    ]
+    # Replaced task 9 stays ahead of tasks which completed later.
+    restored = buffer(owner)
+    restored.load_state_dict(copy.deepcopy(replay.state_dict()))
+    for i in [7, 6, 5, 4]:
+        await restored.put(entries[i])
+    chosen = await restored.get(num_groups=8)
+    assert [entry.group[0].metadata["instance_id"] for entry in chosen] == [
+        f"task_{i}" for i in [9, 2, 1, 8, 7, 6, 5, 4]
+    ]
 
 
 @pytest.mark.parametrize("templated", [False, True])
@@ -258,8 +285,36 @@ async def test_buffer_infeasible_quota_does_not_wait_or_discard(templated):
         await replay.put(completed(data, owner, i, templated=templated))
     selected = await asyncio.wait_for(replay.get(num_groups=8), timeout=1)
     assert len(selected) == 8 and not replay._buffer
+    assert [entry.group[0].metadata["instance_id"] for entry in selected] == [f"task_{i}" for i in range(8)]
     reason = "insufficient_plain" if templated else "insufficient_templated"
     assert owner.metrics[f"consumption/fallback/{reason}"] == 1
+
+
+async def test_eight_complete_sixteen_episode_groups_keep_age_four_and_drop_age_five():
+    data = source(repeats=16)
+    owner = coordinator(data)
+    finish_cycle(owner, [0, 1])
+    replay = buffer(owner)
+    replay._args.max_weight_staleness = 4
+    entries = [completed(data, owner, i, templated=i < 2) for i in range(9)]
+    for entry in entries:
+        for sample in entry.group:
+            sample.response_length = 1
+            sample.weight_versions = [
+                WeightVersionsPerCall(spans=[WeightVersionSpan(version="6", abs_start=0, abs_end=1)])
+            ]
+    # Even one older episode makes the whole ninth task group stale.
+    entries[-1].group[-1].weight_versions[0].spans[0] = WeightVersionSpan(version="5", abs_start=0, abs_end=1)
+    for entry in reversed(entries):
+        await replay.put(entry)
+    selected = await asyncio.wait_for(replay.get(num_groups=8, current_version=10), timeout=1)
+    assert {id(entry) for entry in selected} == {id(entry) for entry in entries[:8]}
+    assert sum(len(entry.group) for entry in selected) == 128
+    for entry in selected:
+        assert len(entry.group) == 16
+        assert len({sample.group_index for sample in entry.group}) == 1
+        assert len({sample.metadata["instance_id"] for sample in entry.group}) == 1
+    assert replay.get_metrics()["rollout/fully_async/stale_groups_filtered"] == 1
 
 
 def test_bonus_free_collection_observes_only_complete_natural_groups():
